@@ -263,22 +263,24 @@ fn parse_sse_block(block: &str) -> (String, String) {
     (event, data)
 }
 
-pub async fn serve(config: Config) -> anyhow::Result<()> {
+pub async fn serve(
+    config: Config,
+    host: &str,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         http: http_client()?,
         key_cursor: std::sync::atomic::AtomicUsize::new(0),
         sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         config,
     });
-    let addr = format!("127.0.0.1:{}", state.config.port);
+    let addr = format!("{host}:{}", state.config.port);
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("zenshim listening on http://{addr}/v1");
-    println!("gateway key: {}", state.config.gateway_key);
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            println!("\nshutting down");
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
         })
         .await?;
     Ok(())

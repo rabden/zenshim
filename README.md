@@ -87,17 +87,51 @@ Pass multiple upstream keys (comma-separated in the wizard, or
 `--keys k1,k2,…`). On `402`/`429` from Zen the gateway rotates to the
 next key and retries; exhausted keys are skipped until restart.
 
+### Console
+
+While running, zenshim offers an interactive console (in a terminal):
+
+```
+zenshim> k    copy the API key to the clipboard
+zenshim> K    reveal the API key on screen
+zenshim> m    list served models, pick one to copy its model id ('a' copies all)
+zenshim> u    copy the base URL
+zenshim> t    copy the tunnel URL (when --tunnel is active)
+zenshim> s    reprint the summary
+zenshim> q    shut down
+```
+
+The key stays off screen by default; values go straight to the clipboard
+(xclip/xsel/wl-copy/pbcopy). Non-terminal runs (pipes, services) get a
+plain summary instead.
+
+### Going public
+
+```bash
+zenshim --tunnel
+```
+
+Starts a free cloudflared quick tunnel (requires the `cloudflared`
+binary, no account) and prints a public `https://…trycloudflare.com`
+URL that routes to your local gateway — use it as the base URL from
+anywhere. The gateway key is the only protection on that URL; rotate
+it with `--gateway-key`. For your own domain, bind on LAN and put your
+reverse proxy in front: `zenshim --host 0.0.0.0 --port 8480`.
+
 ### CLI
 
 ```
 zenshim                 interactive start (wizard on first run)
 zenshim --setup         re-run the wizard
 zenshim --no-wizard     non-interactive: flags/env only
+zenshim --no-tui        disable the interactive console
   --keys k1,k2          upstream keys ("public" = anonymous)
   --models a,b          models to serve (default: all -free)
   --all-models          serve the full live catalog
   --gateway-key KEY     what clients authenticate with
   --port 8480           listen port
+  --host 127.0.0.1      bind address (0.0.0.0 = LAN)
+  --tunnel              expose publicly via a cloudflared quick tunnel
 ```
 
 ## How it works

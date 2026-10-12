@@ -1,12 +1,18 @@
 mod config;
+mod console;
 mod ids;
 mod server;
 mod stream;
 mod translate;
+mod tunnel;
 mod wizard;
 
 use anyhow::Result;
 use clap::Parser;
+use std::io::IsTerminal;
+use std::sync::{Arc, Mutex};
+
+use crate::tunnel::TunnelUrl;
 
 #[derive(Parser)]
 #[command(
@@ -19,6 +25,19 @@ struct Cli {
     /// Skip the setup wizard; use flags/env as-is
     #[arg(long)]
     no_wizard: bool,
+
+    /// Disable the interactive console (print summary and serve)
+    #[arg(long)]
+    no_tui: bool,
+
+    /// Expose the gateway publicly via a cloudflared quick tunnel
+    /// (requires the cloudflared binary; no account needed)
+    #[arg(long)]
+    tunnel: bool,
+
+    /// Address to bind (default 127.0.0.1; use 0.0.0.0 to expose on LAN)
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
 
     /// Comma-separated upstream Zen keys (blank or "public" = anonymous free tier)
     #[arg(long, value_delimiter = ',')]
@@ -64,7 +83,6 @@ async fn main() -> Result<()> {
     let mut config = match config {
         Some(c) => c,
         None => {
-            // Non-interactive path with no saved config: build from flags.
             let keys = cli
                 .keys
                 .clone()
@@ -111,11 +129,63 @@ async fn main() -> Result<()> {
     if let Some(key) = &cli.gateway_key {
         config.gateway_key = key.clone();
     }
+    config.port = cli.port;
+
+    if cli.tunnel || cli.host != "127.0.0.1" {
+        println!(
+            "warning: the gateway is reachable beyond localhost — the gateway \
+             key is its only protection"
+        );
+    }
 
     println!(
         "serving {} model(s) with {} upstream key(s)",
         config.models.len(),
         config.keys.len()
     );
-    server::serve(config).await
+
+    // Optional public tunnel.
+    let tunnel_url: TunnelUrl = Arc::new(Mutex::new(None));
+    let _tunnel_guard = if cli.tunnel {
+        let (guard, url) = tunnel::start(config.port, Arc::clone(&tunnel_url));
+        if url.is_some() {
+            // cloudflared is already connecting; the server binds next.
+        }
+        guard
+    } else {
+        tunnel::TunnelGuard::none()
+    };
+
+    let base_url = format!("http://127.0.0.1:{}/v1", config.port);
+    let console_state = console::ConsoleState {
+        base_url,
+        gateway_key: config.gateway_key.clone(),
+        models: config.models.clone(),
+        tunnel: Arc::clone(&tunnel_url),
+    };
+
+    // Shutdown: Ctrl-C or the console 'q' command.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ctrl_c_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        println!("\nshutting down");
+        let _ = ctrl_c_tx.send(true);
+    });
+
+    let interactive = !cli.no_tui && std::io::stdin().is_terminal();
+    if interactive {
+        console::spawn(console_state, shutdown_tx);
+    } else {
+        // Give the tunnel a moment to report before printing the summary.
+        for _ in 0..8 {
+            if tunnel_url.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        console::print_plain(&console_state);
+    }
+
+    server::serve(config, &cli.host, shutdown_rx).await
 }
