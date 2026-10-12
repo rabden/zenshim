@@ -1,0 +1,22 @@
+services:
+  zenshim:
+    build: ..
+    restart: unless-stopped
+    ports:
+      # Local only. Put a TLS reverse proxy in front before exposing it.
+      - "127.0.0.1:8480:8480"
+    volumes:
+      - zenshim:/data
+    environment:
+      # ZENSHIM_KEYS: "key1,key2"        # default: anonymous free tier
+      # ZENSHIM_GATEWAY_KEY: "sk-..."    # default: generated, see --show-key
+      # Every caller arrives from the Docker bridge address, so they
+      # share one rate-limit bucket; turn it off when only you can reach it.
+      ZENSHIM_RATE_LIMIT: "0"
+    stop_grace_period: 10s
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: [/tmp]
+volumes:
+  zenshim:

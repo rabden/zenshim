@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::keys::Route;
 use crate::stream::ApiFormat;
 
 const MAX_LOGS: usize = 1000;
@@ -41,8 +42,9 @@ pub struct RequestRecord {
     pub stream: bool,
     pub messages: usize,
     pub tools: usize,
-    /// Index of the upstream key that served it.
+    /// Index of the upstream key that served it, and how it got there.
     pub key: Option<usize>,
+    pub route: Option<Route>,
     pub state: ReqState,
     pub duration: Option<Duration>,
     pub tokens_in: u64,
@@ -229,6 +231,7 @@ impl Hub {
             messages: info.messages,
             tools: info.tools,
             key: None,
+            route: None,
             state: ReqState::Active,
             duration: None,
             tokens_in: 0,
@@ -290,8 +293,11 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    pub fn key(&self, index: usize) {
-        hub().update(self.id, |r| r.key = Some(index));
+    pub fn route(&self, key: usize, route: Route) {
+        hub().update(self.id, |r| {
+            r.key = Some(key);
+            r.route = Some(route);
+        });
     }
 
     pub fn finish(mut self, outcome: Outcome) {

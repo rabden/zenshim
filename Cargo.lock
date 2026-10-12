@@ -2267,13 +2267,15 @@ dependencies = [
 
 [[package]]
 name = "zenshim"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "clap",
  "dialoguer",
  "futures-util",
+ "libc",
  "rand 0.9.5",
  "ratatui",
  "reqwest",

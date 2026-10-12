@@ -10,6 +10,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::hub::{hub, Level, RequestRecord, ReqState};
+use crate::keys::{describe, Backend, GateState, RouteState};
 use crate::server::format::ServeFormats;
 use crate::stream::ApiFormat;
 use crate::tunnel::TunnelStatus;
@@ -256,6 +257,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("a", "add"),
             ("d", "remove"),
             ("v", "validate"),
+            ("r", "un-rest"),
             ("R", "rotate gateway key"),
             ("?", "help"),
             ("q", "quit"),
@@ -272,14 +274,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
     let side_by_side = area.width >= 116;
     let [top, recent] = if side_by_side {
-        Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area)
+        Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).areas(area)
     } else {
-        Layout::vertical([Constraint::Length(14), Constraint::Min(0)]).areas(area)
+        Layout::vertical([Constraint::Length(15), Constraint::Min(0)]).areas(area)
     };
     let [gateway, traffic] = if side_by_side {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(46)]).areas(top)
     } else {
-        Layout::vertical([Constraint::Length(7), Constraint::Length(7)]).areas(top)
+        Layout::vertical([Constraint::Length(8), Constraint::Length(7)]).areas(top)
     };
     draw_gateway(frame, app, gateway);
     draw_traffic(frame, traffic);
@@ -350,7 +352,7 @@ fn draw_gateway(frame: &mut Frame, app: &App, area: Rect) {
 
     let gateway_key = state.gateway_key();
     let key_hint = if app.reveal_key { "  K hides" } else { "  K reveals" };
-    let keys = state.keys().len();
+    let keys = state.pool.len();
     let lines = vec![
         Line::from(vec![
             label("OpenAI"),
@@ -379,12 +381,35 @@ fn draw_gateway(frame: &mut Frame, app: &App, area: Rect) {
                 match state.formats {
                     ServeFormats::OpenAi => "openai only",
                     ServeFormats::Anthropic => "anthropic only",
-                    ServeFormats::Both => "both dialects",
+                    ServeFormats::Both => "all dialects",
                 }
             )),
         ]),
     ];
+    let mut lines = lines;
+    lines.push(Line::from(vec![label("Backend"), backend_span(app)]));
     frame.render_widget(Paragraph::new(lines).block(panel("Gateway")), area);
+}
+
+/// Which route requests are taking right now.
+fn backend_span(app: &App) -> Span<'static> {
+    let state = &app.ctx.state;
+    let cli = match state.bridge.version() {
+        Some(version) => format!("OpenCode {version} CLI"),
+        None => "OpenCode CLI".to_string(),
+    };
+    match (state.pool.mode(), state.pool.gate(std::time::SystemTime::now())) {
+        (Backend::Direct, _) => Span::raw("direct wire only"),
+        (Backend::Cli, _) => Span::raw(format!("{cli} only, sandboxed")),
+        (Backend::Auto, GateState::Blocked(left)) => Span::styled(
+            format!("direct wire refused — using the {cli}, retrying direct in {}", describe(left)),
+            Style::new().fg(WARN),
+        ),
+        (Backend::Auto, GateState::Open) if state.pool.cli_usable() => {
+            Span::raw(format!("direct wire · {cli} as fallback"))
+        }
+        (Backend::Auto, GateState::Open) => Span::styled("direct wire · no OpenCode CLI, so no fallback", dim()),
+    }
 }
 
 fn draw_traffic(frame: &mut Frame, area: Rect) {
@@ -396,7 +421,7 @@ fn draw_traffic(frame: &mut Frame, area: Rect) {
     let stat = |name: &'static str, value: String, style: Style| {
         vec![
             Span::styled(format!("{name} "), dim()),
-            Span::styled(format!("{value:<8}"), style),
+            Span::styled(format!("{value:<7}"), style),
         ]
     };
     let active = totals.requests - totals.completed;
@@ -448,7 +473,7 @@ fn requests_table(records: &[RequestRecord], width: u16) -> Table<'static> {
         ];
         if wide {
             cells.push(Cell::from(Span::styled(r.client.clone(), dim())));
-            cells.push(Cell::from(if r.stream { "stream" } else { "" }));
+            cells.push(Cell::from(Span::styled(r.route.map_or("", |route| route.label()), dim())));
         }
         cells.push(Cell::from(tokens));
         cells.push(Cell::from(Line::from(fmt_duration(r.elapsed())).alignment(Alignment::Right)));
@@ -465,7 +490,7 @@ fn requests_table(records: &[RequestRecord], width: u16) -> Table<'static> {
         Constraint::Fill(1),
     ];
     if wide {
-        header.extend(["client", ""]);
+        header.extend(["client", "via"]);
         widths.extend([Constraint::Length(15), Constraint::Length(6)]);
     }
     header.extend(["tokens", "time", "age"]);
@@ -529,9 +554,9 @@ fn draw_requests(frame: &mut Frame, app: &App, area: Rect) {
             fmt_duration(record.elapsed()),
             fmt_age(record.started.elapsed())
         )),
-        field("key", match record.key {
-            Some(i) => format!("upstream key #{}", i + 1),
-            None => "—".to_string(),
+        field("key", match (record.key, record.route) {
+            (Some(i), Some(route)) => format!("upstream key #{} · {}", i + 1, route.label()),
+            _ => "—".to_string(),
         }),
     ];
     if record.tool_calls > 0 {
@@ -645,7 +670,20 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
 // ── keys ─────────────────────────────────────────────────────────────
 
 fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
-    let keys = app.ctx.state.keys();
+    let keys = app.ctx.state.pool.snapshot();
+    let now = std::time::SystemTime::now();
+    let cli_usable = app.ctx.state.pool.cli_usable();
+    let direct_usable = app.ctx.state.pool.mode() != Backend::Cli;
+    // Requests served by a route, or how long it still rests.
+    let route_cell = |route: &RouteState, usable: bool| {
+        let span = match route.cooling(now) {
+            _ if !usable => Span::styled("off", dim()),
+            Some(left) => Span::styled(format!("rests {}", describe(left)), Style::new().fg(WARN)),
+            None if route.served > 0 => Span::raw(fmt_count(route.served)),
+            None => Span::styled("ready", dim()),
+        };
+        Cell::from(Line::from(span).alignment(Alignment::Right))
+    };
     let pending = app.checking.iter().filter(|k| !keys.iter().any(|e| &e.value == *k)).count();
     let [list, gateway] = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).areas(area);
 
@@ -660,7 +698,7 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(format!("{} validating…", spinner()), Style::new().fg(WARN))
             } else if let Some(error) = &key.last_error {
                 Span::styled(error.clone(), Style::new().fg(BAD))
-            } else if key.served > 0 {
+            } else if key.served() > 0 {
                 Span::styled("ok", Style::new().fg(GOOD))
             } else {
                 Span::styled("not used yet", dim())
@@ -668,7 +706,8 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(Span::styled(format!("{:>2}", i + 1), dim())),
                 Cell::from(mask_key(&key.value, false)),
-                Cell::from(Line::from(count(key.served)).alignment(Alignment::Right)),
+                route_cell(&key.direct, direct_usable),
+                route_cell(&key.cli, cli_usable),
                 Cell::from(Line::from(count(key.limited)).alignment(Alignment::Right)),
                 Cell::from(Line::from(count(key.failed)).alignment(Alignment::Right)),
                 Cell::from(state),
@@ -687,7 +726,8 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec![
         Cell::from(Line::from("#").alignment(Alignment::Right)),
         Cell::from("key"),
-        Cell::from(Line::from("served").alignment(Alignment::Right)),
+        Cell::from(Line::from("direct").alignment(Alignment::Right)),
+        Cell::from(Line::from("cli").alignment(Alignment::Right)),
         Cell::from(Line::from("limited").alignment(Alignment::Right)),
         Cell::from(Line::from("failed").alignment(Alignment::Right)),
         Cell::from("state"),
@@ -698,9 +738,10 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
         [
             Constraint::Length(2),
             Constraint::Length(30),
+            Constraint::Length(9),
+            Constraint::Length(9),
             Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(7),
+            Constraint::Length(6),
             Constraint::Min(12),
         ],
     )
@@ -799,6 +840,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::default(),
         section("Keys"),
         entry("a / d / v", "add / remove / validate an upstream key (saved)"),
+        entry("r", "use a resting (exhausted) key again now"),
     ];
     let (rect, block) = overlay(frame, area, "Help", 72, lines.len() as u16 + 4);
     frame.render_widget(Paragraph::new(lines).block(block), rect);

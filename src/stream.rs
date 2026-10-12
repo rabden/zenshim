@@ -3,8 +3,11 @@ use serde_json::{json, Value};
 /// Which client-facing API shape a stream/request renders as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiFormat {
+    /// OpenAI Chat Completions.
     OpenAi,
     Anthropic,
+    /// OpenAI Responses.
+    Responses,
 }
 
 impl ApiFormat {
@@ -12,6 +15,7 @@ impl ApiFormat {
         match self {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
+            Self::Responses => "responses",
         }
     }
 }
@@ -25,7 +29,6 @@ pub struct StreamTranslator {
     id: String,
     created: u64,
     buffer: String,
-    clean_text: String,
     flushed_text: String,
     emitted_tool_calls: Vec<Value>,
     usage: Option<Value>,
@@ -35,6 +38,12 @@ pub struct StreamTranslator {
     anthropic_message_started: bool,
     anthropic_text_block_open: bool,
     anthropic_block_index: usize,
+    /// Responses events are numbered.
+    responses_sequence: u64,
+    responses_started: bool,
+    responses_text_open: bool,
+    /// Request fields a Responses object echoes back.
+    responses_echo: Value,
 }
 
 const FENCE_OPEN: &str = "```tool";
@@ -44,28 +53,22 @@ impl StreamTranslator {
         Self {
             format,
             model,
-            id: match format {
-                ApiFormat::OpenAi => format!(
-                    "chatcmpl-zenshim-{:x}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0)
-                ),
-                ApiFormat::Anthropic => format!(
-                    "msg_zenshim-{:x}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0)
-                ),
+            id: {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                match format {
+                    ApiFormat::OpenAi => format!("chatcmpl-zenshim-{stamp:x}"),
+                    ApiFormat::Anthropic => format!("msg_zenshim-{stamp:x}"),
+                    ApiFormat::Responses => format!("resp_zenshim{stamp:x}"),
+                }
             },
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             buffer: String::new(),
-            clean_text: String::new(),
             flushed_text: String::new(),
             emitted_tool_calls: Vec::new(),
             usage: None,
@@ -75,7 +78,188 @@ impl StreamTranslator {
             anthropic_message_started: false,
             anthropic_text_block_open: false,
             anthropic_block_index: 0,
+            responses_sequence: 0,
+            responses_started: false,
+            responses_text_open: false,
+            responses_echo: json!({}),
         }
+    }
+
+    /// The response id clients will see.
+    #[cfg(test)]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Request fields (instructions, tools, …) to echo in a Responses object.
+    pub fn echo(&mut self, fields: Value) {
+        self.responses_echo = fields;
+    }
+
+    // ------------------------------------------------------------------
+    // Responses rendering
+    // ------------------------------------------------------------------
+
+    fn responses_event(&mut self, kind: &str, mut data: Value) -> String {
+        data["type"] = json!(kind);
+        data["sequence_number"] = json!(self.responses_sequence);
+        self.responses_sequence += 1;
+        format!("event: {kind}\ndata: {data}\n\n")
+    }
+
+    fn responses_message_id(&self) -> String {
+        format!("msg_{}", self.id.trim_start_matches("resp_"))
+    }
+
+    fn responses_message(&self, status: &str, text: &str) -> Value {
+        let content = match status {
+            "in_progress" => json!([]),
+            _ => json!([{ "type": "output_text", "text": text, "annotations": [] }]),
+        };
+        json!({
+            "id": self.responses_message_id(),
+            "type": "message",
+            "status": status,
+            "role": "assistant",
+            "content": content,
+        })
+    }
+
+    fn responses_call(call: &Value, status: &str) -> Value {
+        let call_id = call["id"].as_str().unwrap_or("call");
+        json!({
+            "id": format!("fc_{}", call_id.trim_start_matches("call_")),
+            "type": "function_call",
+            "status": status,
+            "call_id": call_id,
+            "name": call["name"],
+            "arguments": if status == "in_progress" { json!("") } else { call["arguments"].clone() },
+        })
+    }
+
+    /// The output items of the finished answer: its text, then its calls.
+    fn responses_output(&self) -> Vec<Value> {
+        let text = self.flushed_text.trim();
+        let mut output = Vec::new();
+        if !text.is_empty() {
+            output.push(self.responses_message("completed", text));
+        }
+        output.extend(self.emitted_tool_calls.iter().map(|call| Self::responses_call(call, "completed")));
+        output
+    }
+
+    fn responses_object(&self, status: &str, output: Vec<Value>) -> Value {
+        let mut object = json!({
+            "id": self.id,
+            "object": "response",
+            "created_at": self.created,
+            "status": status,
+            "error": Value::Null,
+            "incomplete_details": if status == "incomplete" { json!({ "reason": "max_output_tokens" }) } else { Value::Null },
+            "model": self.model,
+            "output": output,
+            "instructions": Value::Null,
+            "previous_response_id": Value::Null,
+            "parallel_tool_calls": true,
+            "tool_choice": "auto",
+            "tools": [],
+            "metadata": {},
+            "store": true,
+            "text": { "format": { "type": "text" } },
+            "truncation": "disabled",
+            "usage": Value::Null,
+        });
+        if status != "in_progress" {
+            let (input, output) = (self.usage_input(), self.usage_output());
+            object["usage"] = json!({
+                "input_tokens": input,
+                "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens": output,
+                "output_tokens_details": { "reasoning_tokens": 0 },
+                "total_tokens": input + output,
+            });
+        }
+        if let Some(echo) = self.responses_echo.as_object() {
+            for (field, value) in echo {
+                object[field] = value.clone();
+            }
+        }
+        object
+    }
+
+    fn responses_ensure_started(&mut self, out: &mut Vec<String>) {
+        if self.responses_started {
+            return;
+        }
+        self.responses_started = true;
+        let response = self.responses_object("in_progress", Vec::new());
+        out.push(self.responses_event("response.created", json!({ "response": response.clone() })));
+        out.push(self.responses_event("response.in_progress", json!({ "response": response })));
+    }
+
+    fn responses_text_delta(&mut self, text: &str, out: &mut Vec<String>) {
+        self.responses_ensure_started(out);
+        let item_id = self.responses_message_id();
+        if !self.responses_text_open {
+            self.responses_text_open = true;
+            let item = self.responses_message("in_progress", "");
+            out.push(self.responses_event("response.output_item.added", json!({ "output_index": 0, "item": item })));
+            out.push(self.responses_event(
+                "response.content_part.added",
+                json!({
+                    "item_id": item_id, "output_index": 0, "content_index": 0,
+                    "part": { "type": "output_text", "text": "", "annotations": [] },
+                }),
+            ));
+        }
+        out.push(self.responses_event(
+            "response.output_text.delta",
+            json!({ "item_id": item_id, "output_index": 0, "content_index": 0, "delta": text }),
+        ));
+    }
+
+    /// Close the text item, emit each call as its own item, then the
+    /// final response object.
+    fn responses_finish(&mut self, out: &mut Vec<String>) {
+        self.responses_ensure_started(out);
+        let mut index = 0;
+        if self.responses_text_open {
+            let item_id = self.responses_message_id();
+            let text = self.flushed_text.trim().to_string();
+            out.push(self.responses_event(
+                "response.output_text.done",
+                json!({ "item_id": item_id, "output_index": 0, "content_index": 0, "text": text }),
+            ));
+            out.push(self.responses_event(
+                "response.content_part.done",
+                json!({
+                    "item_id": item_id, "output_index": 0, "content_index": 0,
+                    "part": { "type": "output_text", "text": text, "annotations": [] },
+                }),
+            ));
+            let item = self.responses_message("completed", &text);
+            out.push(self.responses_event("response.output_item.done", json!({ "output_index": 0, "item": item })));
+            index = 1;
+        }
+        for call in self.emitted_tool_calls.clone() {
+            let pending = Self::responses_call(&call, "in_progress");
+            let done = Self::responses_call(&call, "completed");
+            let item_id = done["id"].clone();
+            out.push(self.responses_event("response.output_item.added", json!({ "output_index": index, "item": pending })));
+            out.push(self.responses_event(
+                "response.function_call_arguments.delta",
+                json!({ "item_id": item_id, "output_index": index, "delta": call["arguments"] }),
+            ));
+            out.push(self.responses_event(
+                "response.function_call_arguments.done",
+                json!({ "item_id": item_id, "output_index": index, "arguments": call["arguments"] }),
+            ));
+            out.push(self.responses_event("response.output_item.done", json!({ "output_index": index, "item": done })));
+            index += 1;
+        }
+        let status = if self.truncated { "incomplete" } else { "completed" };
+        let response = self.responses_object(status, self.responses_output());
+        out.push(self.responses_event(&format!("response.{status}"), json!({ "response": response })));
     }
 
     // ------------------------------------------------------------------
@@ -185,9 +369,12 @@ impl StreamTranslator {
             return pos;
         }
         // Partial fence opener at the tail: hold the partial prefix.
+        // Compared as bytes: the tail may end inside a multi-byte character,
+        // where slicing the string itself would panic.
         let bytes = self.buffer.as_bytes();
-        for hold in (1..=FENCE_OPEN.len()).rev() {
-            if bytes.len() >= hold && &self.buffer[bytes.len() - hold..] == &FENCE_OPEN[..hold] {
+        let fence = FENCE_OPEN.as_bytes();
+        for hold in (1..=fence.len()).rev() {
+            if bytes.len() >= hold && bytes[bytes.len() - hold..] == fence[..hold] {
                 return bytes.len() - hold;
             }
         }
@@ -202,6 +389,7 @@ impl StreamTranslator {
         self.flushed_text.push_str(text);
         match self.format {
             ApiFormat::OpenAi => out.push(self.openai_chunk(json!({ "content": text }), None)),
+            ApiFormat::Responses => self.responses_text_delta(text, out),
             ApiFormat::Anthropic => {
                 self.anthropic_open_text_block(out);
                 out.push(self.anthropic_event(
@@ -281,7 +469,6 @@ impl StreamTranslator {
         }
         clean_text.push_str(rest);
         let clean_text = clean_text.trim().to_string();
-        self.clean_text = clean_text.clone();
         self.emit_text(&clean_text, &mut out);
         if self.format == ApiFormat::Anthropic {
             self.anthropic_close_text_block(&mut out);
@@ -303,6 +490,8 @@ impl StreamTranslator {
                         None,
                     ));
                 }
+                // Rendered together with the final object, below.
+                ApiFormat::Responses => {}
                 ApiFormat::Anthropic => {
                     self.anthropic_ensure_started(&mut out);
                     let index = self.anthropic_block_index;
@@ -357,6 +546,7 @@ impl StreamTranslator {
                 }
                 out.push("data: [DONE]\n\n".to_string());
             }
+            ApiFormat::Responses => self.responses_finish(&mut out),
             ApiFormat::Anthropic => {
                 self.anthropic_ensure_started(&mut out);
                 let stop_reason = if self.truncated {
@@ -414,16 +604,33 @@ impl StreamTranslator {
 
     /// Final assembled message for non-streaming responses.
     pub fn into_completion(mut self) -> Value {
+        self.completion()
+    }
+
+    /// The same, leaving the translator usable (to store the response).
+    pub fn completion(&mut self) -> Value {
         if !self.finished {
             self.close();
         }
-        let content = format!("{}{}", self.flushed_text, self.clean_text).trim().to_string();
+        // finish() already flushed whatever the buffer still held.
+        let content = self.flushed_text.trim().to_string();
         match self.format {
             ApiFormat::OpenAi => {
                 let mut message =
                     json!({ "role": "assistant", "content": if content.is_empty() { Value::Null } else { json!(content) } });
                 if !self.emitted_tool_calls.is_empty() {
-                    message["tool_calls"] = json!(self.emitted_tool_calls);
+                    let calls: Vec<Value> = self
+                        .emitted_tool_calls
+                        .iter()
+                        .map(|call| {
+                            json!({
+                                "id": call["id"],
+                                "type": "function",
+                                "function": { "name": call["name"], "arguments": call["arguments"] },
+                            })
+                        })
+                        .collect();
+                    message["tool_calls"] = json!(calls);
                 }
                 json!({
                     "id": self.id,
@@ -439,6 +646,10 @@ impl StreamTranslator {
                         "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
                     })),
                 })
+            }
+            ApiFormat::Responses => {
+                let status = if self.truncated { "incomplete" } else { "completed" };
+                self.responses_object(status, self.responses_output())
             }
             ApiFormat::Anthropic => {
                 let mut blocks: Vec<Value> = Vec::new();
@@ -491,4 +702,201 @@ fn parse_tool_block(payload: &str) -> Option<Value> {
         "name": name,
         "arguments": arguments,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delta(text: &str) -> String {
+        json!({ "delta": text }).to_string()
+    }
+
+    const DONE: &str = r#"{"response":{"usage":{"input_tokens":10,"output_tokens":4}}}"#;
+
+    /// Everything the translator renders for these upstream text deltas.
+    fn run(format: ApiFormat, deltas: &[&str], last: &str) -> (Vec<String>, StreamTranslator) {
+        let mut translator = StreamTranslator::new(format, "m".to_string());
+        let mut out = Vec::new();
+        for text in deltas {
+            out.extend(translator.feed("response.output_text.delta", &delta(text)));
+        }
+        out.extend(translator.feed(last, DONE));
+        (out, translator)
+    }
+
+    fn openai_text(out: &[String]) -> String {
+        out.iter()
+            .filter_map(|chunk| chunk.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str().map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn text_ending_in_any_character_streams_without_panicking() {
+        // Tails of 1-4 byte characters, which once crashed the fence check.
+        for text in ["caf\u{e9}", "ok \u{2713}", "hi \u{1f600}", "\u{4f60}\u{597d}", "a`", "x``"] {
+            let (out, translator) = run(ApiFormat::OpenAi, &[text], "response.completed");
+            assert_eq!(openai_text(&out), text.trim());
+            assert!(translator.is_finished());
+        }
+    }
+
+    #[test]
+    fn plain_text_streams_as_it_arrives_with_usage_at_the_end() {
+        let (out, translator) = run(ApiFormat::OpenAi, &["Hel", "lo"], "response.completed");
+        assert_eq!(openai_text(&out), "Hello");
+        assert!(out.len() >= 3, "each delta is its own chunk");
+        assert_eq!(translator.outcome(), ("stop", Some((10, 4)), 0));
+        let completion = translator.into_completion();
+        assert_eq!(completion["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(completion["usage"]["total_tokens"], 14);
+    }
+
+    #[test]
+    fn a_tool_block_split_across_deltas_becomes_a_tool_call_not_text() {
+        let deltas = ["Let me check.\n``", "`tool\n{\"name\": \"calc\", \"argu", "ments\": {\"expr\": \"2+2\"}}\n```"];
+        let (out, translator) = run(ApiFormat::OpenAi, &deltas, "response.completed");
+        assert_eq!(openai_text(&out).trim_end(), "Let me check.");
+        assert!(!out.concat().contains("```"), "no fence leaks into the content");
+        assert_eq!(translator.outcome().0, "tool_calls");
+        let completion = translator.into_completion();
+        let call = &completion["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "calc");
+        let arguments: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({ "expr": "2+2" }));
+        assert_eq!(completion["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn text_held_back_until_the_end_appears_once() {
+        // A trailing backtick is held as a possible fence, then flushed at
+        // the end; so is text that follows a tool block.
+        let (_, translator) = run(ApiFormat::OpenAi, &["Use `x"], "response.completed");
+        assert_eq!(translator.into_completion()["choices"][0]["message"]["content"], "Use `x");
+        let (_, translator) = run(ApiFormat::OpenAi, &["tick `"], "response.completed");
+        assert_eq!(translator.into_completion()["choices"][0]["message"]["content"], "tick `");
+        let deltas = ["Before.\n```tool\n{\"name\": \"t\", \"arguments\": {}}\n```\nAfter."];
+        let (_, translator) = run(ApiFormat::Anthropic, &deltas, "response.completed");
+        let message = translator.into_completion();
+        let text = message["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.matches("After.").count(), 1);
+        assert_eq!(text.matches("Before.").count(), 1);
+    }
+
+    #[test]
+    fn anthropic_renders_text_blocks_and_tool_use() {
+        let deltas = ["Checking.\n```tool\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Paris\"}}\n```"];
+        let (out, translator) = run(ApiFormat::Anthropic, &deltas, "response.completed");
+        let wire = out.concat();
+        for event in ["message_start", "content_block_start", "content_block_delta", "message_delta", "message_stop"] {
+            assert!(wire.contains(&format!("event: {event}")), "missing {event}");
+        }
+        let message = translator.into_completion();
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert_eq!(message["content"][0]["text"], "Checking.");
+        assert_eq!(message["content"][1]["type"], "tool_use");
+        assert_eq!(message["content"][1]["name"], "weather");
+        assert_eq!(message["content"][1]["input"], json!({ "city": "Paris" }));
+        assert_eq!(message["usage"], json!({ "input_tokens": 10, "output_tokens": 4 }));
+    }
+
+    /// (event name, data) pairs of a rendered Responses stream.
+    fn responses_events(out: &[String]) -> Vec<(String, Value)> {
+        out.iter()
+            .map(|block| {
+                let (event, data) = block.trim_end().split_once("\ndata: ").unwrap();
+                (event.trim_start_matches("event: ").to_string(), serde_json::from_str(data).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn responses_stream_follows_the_standard_event_sequence() {
+        let deltas = ["Check", "ing.\n```tool\n{\"name\": \"calc\", \"arguments\": {\"expr\": \"2+2\"}}\n```"];
+        let (out, _) = run(ApiFormat::Responses, &deltas, "response.completed");
+        let events = responses_events(&out);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        for (index, (name, data)) in events.iter().enumerate() {
+            assert_eq!(data["type"], name.as_str());
+            assert_eq!(data["sequence_number"], index as u64);
+        }
+        let said: String = events
+            .iter()
+            .filter(|(name, _)| name == "response.output_text.delta")
+            .map(|(_, data)| data["delta"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(said.trim_end(), "Checking.");
+        let response = &events.last().unwrap().1["response"];
+        assert_eq!(response["status"], "completed");
+        assert_eq!(response["output"][0]["content"][0]["text"], "Checking.");
+        assert_eq!(response["output"][1]["type"], "function_call");
+        assert_eq!(response["output"][1]["name"], "calc");
+        assert_eq!(response["output"][1]["arguments"], "{\"expr\":\"2+2\"}");
+        assert_eq!(response["usage"]["total_tokens"], 14);
+    }
+
+    #[test]
+    fn responses_object_echoes_request_fields_and_reports_truncation() {
+        let mut translator = StreamTranslator::new(ApiFormat::Responses, "m".to_string());
+        translator.echo(json!({ "instructions": "Be terse.", "store": false, "previous_response_id": "resp_1" }));
+        translator.feed("response.output_text.delta", &delta("Partial"));
+        translator.feed("response.incomplete", DONE);
+        let id = translator.id().to_string();
+        let response = translator.into_completion();
+        assert!(id.starts_with("resp_") && response["id"] == id.as_str());
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(response["instructions"], "Be terse.");
+        assert_eq!(response["store"], false);
+        assert_eq!(response["previous_response_id"], "resp_1");
+        assert_eq!(response["output"][0]["content"][0]["text"], "Partial");
+    }
+
+    #[test]
+    fn an_incomplete_response_reports_truncation_in_both_dialects() {
+        let (_, openai) = run(ApiFormat::OpenAi, &["Partial"], "response.incomplete");
+        assert_eq!(openai.into_completion()["choices"][0]["finish_reason"], "length");
+        let (_, anthropic) = run(ApiFormat::Anthropic, &["Partial"], "response.incomplete");
+        assert_eq!(anthropic.into_completion()["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn a_stream_that_just_stops_still_yields_what_arrived() {
+        let mut translator = StreamTranslator::new(ApiFormat::OpenAi, "m".to_string());
+        translator.feed("response.output_text.delta", &delta("Half an ans"));
+        assert!(!translator.is_finished());
+        assert!(!translator.close().is_empty());
+        assert_eq!(translator.into_completion()["choices"][0]["message"]["content"], "Half an ans");
+    }
+
+    #[test]
+    fn events_after_completion_and_unparsable_data_are_ignored() {
+        let (_, mut translator) = run(ApiFormat::OpenAi, &["Done"], "response.completed");
+        assert!(translator.feed("response.output_text.delta", &delta("extra")).is_empty());
+        let mut fresh = StreamTranslator::new(ApiFormat::OpenAi, "m".to_string());
+        assert!(fresh.feed("response.output_text.delta", "not json").is_empty());
+        assert!(fresh.feed("ping", "{}").is_empty());
+    }
 }

@@ -19,7 +19,7 @@ use tokio::sync::watch;
 use crate::clipboard;
 use crate::config::Config;
 use crate::hub::{self, hub, RequestRecord, ReqState};
-use crate::server::{SharedState, UpstreamKey};
+use crate::server::SharedState;
 use crate::tunnel::{Tunnel, TunnelStatus};
 use crate::wizard;
 
@@ -351,7 +351,7 @@ impl App {
     fn refresh_catalog(&mut self) {
         self.catalog = Catalog::Loading;
         let http = self.ctx.http.clone();
-        let key = self.ctx.state.keys().first().map(|k| k.value.clone());
+        let key = self.ctx.state.pool.values().into_iter().next();
         let tx = self.tx.clone();
         self.ctx.runtime.spawn(async move {
             let result = match key {
@@ -389,29 +389,18 @@ impl App {
                 let label = mask_key(&key, false);
                 match (result, add) {
                     (Ok(()), true) => {
-                        {
-                            let mut keys = self.ctx.state.keys.write().unwrap();
-                            if !keys.iter().any(|k| k.value == key) {
-                                keys.push(UpstreamKey::new(key));
-                            }
-                        }
+                        self.ctx.state.pool.add(key);
                         self.save(|saved, live| saved.keys = live.keys);
                         hub::info(format!("upstream key {label} added"));
                         self.good(format!("key {label} is valid — added"));
                     }
                     (Ok(()), false) => {
-                        if let Some(k) = self.ctx.state.keys.write().unwrap().iter_mut().find(|k| k.value == key) {
-                            k.last_error = None;
-                        }
+                        self.ctx.state.pool.set_error(&key, None);
                         self.good(format!("key {label} is valid"));
                     }
                     (Err(e), add) => {
                         if !add {
-                            if let Some(k) =
-                                self.ctx.state.keys.write().unwrap().iter_mut().find(|k| k.value == key)
-                            {
-                                k.last_error = Some(e.clone());
-                            }
+                            self.ctx.state.pool.set_error(&key, Some(e.clone()));
                         }
                         hub::warn(format!("upstream key {label} rejected: {e}"));
                         self.bad(format!("key {label} rejected — details in Logs"));
@@ -458,7 +447,7 @@ impl App {
             KeyCode::Esc => {}
             KeyCode::Enter => {
                 let existing: Vec<String> =
-                    self.ctx.state.keys().into_iter().map(|k| k.value).collect();
+                    self.ctx.state.pool.values();
                 let mut queued = 0;
                 for candidate in value.split(',').map(str::trim).filter(|k| !k.is_empty()) {
                     if existing.iter().any(|k| k == candidate) {
@@ -520,13 +509,13 @@ impl App {
                 }
             }
             Confirm::RemoveKey(key) => {
-                {
-                    let mut keys = self.ctx.state.keys.write().unwrap();
-                    if keys.len() <= 1 {
-                        return;
-                    }
-                    keys.retain(|k| k.value != key);
+                if !self.ctx.state.pool.remove(&key) {
+                    return;
                 }
+                // Its CLI backend, if one is running, has nothing left to serve.
+                let bridge = std::sync::Arc::clone(&self.ctx.state.bridge);
+                let removed = key.clone();
+                self.ctx.runtime.spawn(async move { bridge.forget(&removed).await });
                 self.save(|saved, live| saved.keys = live.keys);
                 hub::info(format!("upstream key {} removed", mask_key(&key, false)));
                 self.good("upstream key removed");
@@ -685,9 +674,16 @@ impl App {
     }
 
     fn on_keys_key(&mut self, key: KeyEvent) {
-        let keys = self.ctx.state.keys();
+        let keys = self.ctx.state.pool.snapshot();
         let cursor = self.key_cursor.min(keys.len().saturating_sub(1));
         match key.code {
+            KeyCode::Char('r') => {
+                if let Some(entry) = keys.get(cursor) {
+                    self.ctx.state.pool.reset(&entry.value);
+                    hub::info(format!("upstream key {} marked usable again", mask_key(&entry.value, false)));
+                    self.good("key marked usable again on both routes");
+                }
+            }
             KeyCode::Char('a') => self.mode = Mode::AddKey(String::new()),
             KeyCode::Char('d') | KeyCode::Delete => {
                 if keys.len() <= 1 {

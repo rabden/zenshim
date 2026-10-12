@@ -1,0 +1,51 @@
+# systemd unit for zenshim.
+#
+#   sudo install -m 755 zenshim /usr/local/bin/zenshim
+#   sudo install -m 644 deploy/zenshim.service /etc/systemd/system/
+#   sudo systemctl enable --now zenshim
+#   sudo ZENSHIM_CONFIG_DIR=/var/lib/zenshim zenshim --show-key
+#
+# Settings go in /etc/zenshim.env (optional), one NAME=value per line:
+#   ZENSHIM_KEYS=key1,key2
+#   ZENSHIM_PORT=8480
+[Unit]
+Description=zenshim gateway for OpenCode Zen
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/zenshim --no-tui --no-wizard
+EnvironmentFile=-/etc/zenshim.env
+Environment=ZENSHIM_CONFIG_DIR=/var/lib/zenshim HOME=/var/lib/zenshim
+Restart=on-failure
+RestartSec=3
+# In-flight answers get a few seconds to finish.
+TimeoutStopSec=15
+
+# Runs as a throwaway user that owns only /var/lib/zenshim.
+DynamicUser=yes
+StateDirectory=zenshim
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

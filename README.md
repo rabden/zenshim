@@ -1,199 +1,120 @@
 # zenshim
 
-**A local OpenAI-compatible API gateway for OpenCode Zen's free tier.**
+**A local API gateway that lets any OpenAI- or Anthropic-compatible
+client use OpenCode Zen's free models.**
 
-Zen's free models (muse-spark, exo, space-bunny, …) reject any client
-that isn't the official OpenCode CLI:
+Zen's free models (muse-spark, space-bunny, …) reject every client that
+is not the official OpenCode CLI:
 
 ```
 403 FreeTierError: "OpenCode's free tier can only be used from within OpenCode"
 ```
 
-zenshim runs as a tiny local server that speaks the OpenAI
-Chat Completions API on one side and the gate-passing request shape on
-the other. Point any OpenAI-compatible product — SDKs, agents, IDE
-plugins, curl — at it and the free models just work, **including
-function calling and image input**, transparently translated.
+zenshim sits in between. Your tools talk to it in the dialect they
+already speak; it reshapes each request into one Zen accepts and
+translates the answer back.
 
-Single static binary, no runtime, no config files required — start it,
-use it, Ctrl-C it.
+```
+your client ──(OpenAI or Anthropic API + gateway key)──▶ zenshim ──▶ OpenCode Zen
+```
+
+## What you get
+
+- **Three client dialects at once**: OpenAI Chat Completions, OpenAI
+  Responses and Anthropic Messages, streaming and non-streaming.
+- **Function calling** in each dialect's own shape, and **image, PDF and
+  file input**.
+- **Several upstream keys**, rotated automatically; an exhausted key
+  rests for 24 hours and comes back by itself.
+- **Two routes to Zen**: a fast direct one, and an automatic fallback
+  through a sandboxed OpenCode CLI when the direct one is exhausted or
+  refused.
+- **A full-screen terminal app** showing live requests, models, keys and
+  logs, where models and keys can be changed without a restart.
+- **One-flag public URL** through a cloudflared quick tunnel.
+- **Built to be left running**: rate limiting, concurrency caps,
+  timeouts, metrics, Docker and systemd packaging.
+- One small binary. No runtime, no account.
 
 ## Install
 
-One-liner (Linux/macOS):
+Linux and macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rabden/zenshim/main/install.sh | sh
 ```
 
-Installs the latest release binary to `/usr/local/bin` (or `~/.local/bin`)
-and prints `zenshim <version>`. Windows: download
-`zenshim-x86_64-pc-windows-msvc.zip` from
-[releases](https://github.com/rabden/zenshim/releases).
+This puts the latest release in `/usr/local/bin` (or `~/.local/bin`).
+On Windows, download `zenshim-x86_64-pc-windows-msvc.zip` from
+[releases](https://github.com/rabden/zenshim/releases). From source:
+`cargo build --release`.
 
-From source:
-
-```bash
-cargo build --release
-# binary: target/release/zenshim
-```
-
-## Use
+## Quick start
 
 ```bash
-./zenshim
+zenshim
 ```
 
-First run starts an interactive setup:
-
-1. paste your Zen API keys (or leave blank for the anonymous free tier),
-2. keys are validated live against the catalog,
-3. pick which models to serve (all `-free` models preselected),
-4. done — the dashboard opens with the endpoints and a generated gateway
-   key (`k` copies it).
-
-Then from anything that speaks OpenAI:
+The first run asks for your Zen API keys (leave it blank for the
+anonymous free tier), checks them, and lets you pick the models to
+serve. Then the dashboard opens. Press `k` to copy the gateway key and
+`u` to copy the base URL, and point a client at it:
 
 ```bash
-curl http://127.0.0.1:8480/v1/chat/completions \
-  -H "Authorization: Bearer sk-zenshim-…" \
-  -H "Content-Type: application/json" \
-  -d '{"model": "muse-spark-1.3-contributor-free",
-       "messages": [{"role": "user", "content": "hello"}]}'
+export OPENAI_BASE_URL=http://127.0.0.1:8480/v1
+export OPENAI_API_KEY=sk-zenshim-…        # the gateway key
 ```
-
-Or in an SDK:
 
 ```python
-client = OpenAI(base_url="http://127.0.0.1:8480/v1", api_key="sk-zenshim-…")
+from openai import OpenAI
+client = OpenAI()   # reads the two variables above
+reply = client.chat.completions.create(
+    model="muse-spark-1.3-contributor-free",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(reply.choices[0].message.content)
 ```
 
-### API surface
-
-zenshim speaks **both** major client dialects, simultaneously by default:
-
-| Route | Dialect | Behavior |
-|---|---|---|
-| `POST /v1/chat/completions` | OpenAI | streaming + non-streaming; `tools` → standard `tool_calls` (results back as `role:"tool"`); `image_url` parts supported |
-| `POST /v1/messages` | Anthropic | streaming + non-streaming; `tools` → `tool_use` blocks (results back as `tool_result`); base64 `image` sources supported; auth via `x-api-key` or `Bearer` |
-| `GET /v1/models` | OpenAI | the models selected at setup |
-| `GET /health` | — | liveness |
-
-Point Anthropic SDKs at it directly:
+Anthropic clients use the same port without the `/v1`:
 
 ```python
+from anthropic import Anthropic
 client = Anthropic(base_url="http://127.0.0.1:8480", api_key="sk-zenshim-…")
-client.messages.create(model="muse-spark-1.3-contributor-free", max_tokens=1024,
-                       messages=[{"role": "user", "content": "hi"}])
 ```
 
-To serve a single dialect: `--format openai` or `--format anthropic`
-(the other route then returns 404). Note: reasoning models spend output
-tokens on thinking, so the gateway floors `max_tokens` at 1024 and reports
-real truncation as `stop_reason: "max_tokens"` / `finish_reason: "length"`.
+## Documentation
 
-### Key stacking
+| | |
+|---|---|
+| [Getting started](docs/getting-started.md) | install, first run, connecting SDKs and tools |
+| [The app](docs/app.md) | the terminal interface, tab by tab |
+| [API reference](docs/api.md) | routes, inputs, function calling, errors, what is not supported |
+| [Keys, routes and fallback](docs/routing.md) | key rotation, the 24-hour rest, the CLI fallback and its sandbox |
+| [Configuration](docs/configuration.md) | every flag and environment variable, files, limits |
+| [Deployment](docs/deployment.md) | public tunnel, Docker, systemd, reverse proxy, metrics |
+| [How it works](docs/how-it-works.md) | the translation, in detail, and a map of the code |
+| [Troubleshooting](docs/troubleshooting.md) | symptoms and fixes |
+| [Changelog](CHANGELOG.md) | what changed in each release |
 
-Pass multiple upstream keys (comma-separated in the wizard, or
-`--keys k1,k2,…`). On `402`/`429` from Zen the gateway rotates to the
-next key and retries. Add or remove keys while running from the Keys tab.
+## Known limits
 
-### The app
-
-In a terminal, zenshim runs as a full-screen app (built on
-[ratatui](https://ratatui.rs)) with five tabs — `Tab`, `←→` or `1`-`5`
-switch between them:
-
-| Tab | What it shows | Keys |
-|---|---|---|
-| **Dashboard** | endpoints, tunnel state, gateway key, live traffic (totals, tokens, average time, requests/second) and recent requests | |
-| **Requests** | every request with status, dialect, model, client, tokens and duration; the selected one in detail, including the error or finish reason | `f` filter all/errors/active, `x` clear |
-| **Models** | the live catalog with what is served and per-model usage | `Space` serve on/off, `Enter` copy id, `a` copy all served ids, `/` search, `f` free tier/whole catalog, `r` refresh |
-| **Keys** | upstream keys with served / rate-limited / failed counts, and the gateway key | `a` add (validated first), `d` remove, `v` validate |
-| **Logs** | gateway, tunnel and error messages | `↑↓` scroll, `G` follow |
-
-Available everywhere:
-
-```
-k / K    copy the gateway API key / reveal or hide it
-u / U    copy the OpenAI base URL / the Anthropic base URL
-t / T    copy the tunnel URL / start or stop the tunnel
-R        rotate the gateway key
-?        all keys
-q        shut down (also Ctrl-C)
-```
-
-Changes made in the app — models served, upstream keys, a rotated
-gateway key — apply immediately, without a restart, and are saved to the
-config file. The key stays off screen by default; values go straight to
-the clipboard (xclip/xsel/wl-copy/pbcopy). Non-terminal runs (pipes,
-services) and `--no-tui` get a plain summary and log lines instead.
-
-### Going public
-
-```bash
-zenshim --tunnel
-```
-
-(or press `T` in the app.) Starts a free cloudflared quick tunnel (no account; `cloudflared` is
-auto-downloaded to `~/.local/share/zenshim/` on first use) and prints a public `https://…trycloudflare.com`
-URL that routes to your local gateway — use it as the base URL from
-anywhere. The gateway key is the only protection on that URL; rotate
-it with `--gateway-key`. For your own domain, bind on LAN and put your
-reverse proxy in front: `zenshim --host 0.0.0.0 --port 8480`.
-
-### CLI
-
-```
-zenshim                 interactive start (wizard on first run)
-zenshim --setup         re-run the wizard
-zenshim --no-wizard     non-interactive: flags/env only
-zenshim --no-tui        plain output instead of the full-screen app
-  --keys k1,k2          upstream keys ("public" = anonymous)
-  --models a,b          models to serve (default: all -free)
-  --all-models          serve the full live catalog
-  --gateway-key KEY     what clients authenticate with
-  --port 8480           listen port
-  --host 127.0.0.1      bind address (0.0.0.0 = LAN)
-  --tunnel              expose publicly via a cloudflared quick tunnel
-  --format both         API shapes to serve: openai | anthropic | both
-```
-
-## How it works
-
-Every outgoing request is reshaped to what the Zen gateway validates:
-official client `User-Agent`, no SDK fingerprint headers, freshly minted
-OpenCode SortableID session ids, a verbatim OpenCode prompt as the
-leading developer message (defused by a precedence preamble), the whole
-conversation consolidated into a single user transcript with `input_image`
-blocks carried for the latest image turn, no native `tools`, `stream: true`.
-
-Function calling runs as a text protocol on the wire: the client's tool
-definitions are described in the system prompt, the model emits fenced
-` ```tool ` blocks, and the gateway parses them out of the stream and
-re-emits them as standard OpenAI `tool_calls` (in streaming chunks too,
-with `finish_reason: "tool_calls"`). Tool results sent back as `role:"tool"`
-messages are folded into the next request's transcript.
-
-The full gate analysis — every rule, what fails, why — lives in
-[pi-opencode-zen/docs/zen-gate-notes.md](https://github.com/rabden/pi-opencode-zen/blob/main/docs/zen-gate-notes.md),
-the Pi extension built on the same findings.
-
-## Limits
-
-- Marker prompt and UA are pinned to OpenCode CLI 1.19.0; if Zen rotates
-  them the gateway 403s until re-captured (see the notes doc).
-- Free-tier quota is per IP and enforced by OpenCode; stacking keys helps
-  with key-scoped limits, not IP-scoped ones.
-- Images from only the most recent turn are carried on the wire.
-- Occasionally the model's answer tastes like a title (marker persona
-  residue) — retry the request.
+- The direct route imitates OpenCode CLI 1.19.0. If Zen changes what its
+  gate accepts, direct requests get `403` until the recipe is updated;
+  with OpenCode 2 or newer installed, requests move to the CLI route by
+  themselves in the meantime.
+- The free tier's quota is enforced by OpenCode, partly per IP address.
+  More keys help with per-key limits, not per-IP ones.
+- Attachments from only the most recent turn that has any are sent.
+- Now and then an answer over the direct route reads like a title
+  rather than a reply. Retry the request.
+- The CLI route cannot cap output length, so `max_tokens` is not
+  enforced there.
 
 ## Disclaimer
 
-Unofficial, not affiliated with OpenCode. Free-tier access outside the
-official client may conflict with OpenCode's terms — review them before
-use. May break at any time as the service evolves.
+Unofficial and not affiliated with OpenCode. Using the free tier from
+outside the official client may conflict with OpenCode's terms; read
+them before you rely on this. It can stop working at any time.
 
 ## License
 

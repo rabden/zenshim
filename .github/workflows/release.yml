@@ -51,3 +51,41 @@ jobs:
         with:
           files: |
             zenshim-${{ matrix.target }}.*
+
+  # Container image on GitHub's registry, wrapping the Linux binaries
+  # built above: ghcr.io/<owner>/zenshim:<version> and :latest.
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for pair in amd64:x86_64 arm64:aarch64; do
+            mkdir -p "dist/${pair%%:*}"
+            gh release download "$GITHUB_REF_NAME" \
+              --pattern "zenshim-${pair##*:}-unknown-linux-gnu.tar.gz" --output - \
+              | tar xz -C "dist/${pair%%:*}"
+          done
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ env.VERSION }}
+            ghcr.io/${{ github.repository }}:latest

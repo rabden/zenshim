@@ -1,0 +1,15 @@
+# Used by the release workflow: wraps the binaries it already built
+# (dist/<arch>/zenshim) instead of compiling again per architecture.
+FROM ubuntu:24.04
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin zenshim \
+    && mkdir /data && chown zenshim:zenshim /data
+COPY dist/${TARGETARCH}/zenshim /usr/local/bin/zenshim
+USER zenshim
+ENV ZENSHIM_CONFIG_DIR=/data HOME=/data ZENSHIM_HOST=0.0.0.0
+VOLUME /data
+EXPOSE 8480
+ENTRYPOINT ["zenshim", "--no-tui", "--no-wizard"]
