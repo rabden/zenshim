@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
+    /// Which API shapes to serve: openai, anthropic, or both
+    #[arg(long, default_value = "both")]
+    format: String,
+
     /// Comma-separated upstream Zen keys (blank or "public" = anonymous free tier)
     #[arg(long, value_delimiter = ',')]
     keys: Option<Vec<String>>,
@@ -138,6 +142,10 @@ async fn main() -> Result<()> {
         );
     }
 
+    let Some(formats) = server::format::ServeFormats::parse(&cli.format) else {
+        anyhow::bail!("--format must be one of: openai, anthropic, both");
+    };
+
     println!(
         "serving {} model(s) with {} upstream key(s)",
         config.models.len(),
@@ -187,5 +195,5 @@ async fn main() -> Result<()> {
         console::print_plain(&console_state);
     }
 
-    server::serve(config, &cli.host, shutdown_rx).await
+    server::serve(config, &cli.host, formats, shutdown_rx).await
 }

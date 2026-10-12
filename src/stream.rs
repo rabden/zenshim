@@ -1,8 +1,17 @@
 use serde_json::{json, Value};
 
-/// Translates a Zen Responses-API SSE stream into OpenAI chat-completions
-/// chunks, synthesizing tool_calls from fenced ```tool blocks in the text.
+/// Which client-facing API shape a stream/request renders as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiFormat {
+    OpenAi,
+    Anthropic,
+}
+
+/// Core accumulator over a Zen Responses-API SSE stream. Renders either
+/// OpenAI chat.completion chunks or Anthropic Messages events, and
+/// synthesizes tool calls from fenced ```tool blocks in the text.
 pub struct StreamTranslator {
+    format: ApiFormat,
     model: String,
     id: String,
     created: u64,
@@ -11,20 +20,37 @@ pub struct StreamTranslator {
     flushed_text: String,
     emitted_tool_calls: Vec<Value>,
     usage: Option<Value>,
+    truncated: bool,
     finished: bool,
     tool_call_index: usize,
+    anthropic_message_started: bool,
+    anthropic_text_block_open: bool,
+    anthropic_block_index: usize,
 }
 
 const FENCE_OPEN: &str = "```tool";
 
 impl StreamTranslator {
-    pub fn new(model: String) -> Self {
+    pub fn new(format: ApiFormat, model: String) -> Self {
         Self {
+            format,
             model,
-            id: format!("chatcmpl-zenshim-{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)),
+            id: match format {
+                ApiFormat::OpenAi => format!(
+                    "chatcmpl-zenshim-{:x}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0)
+                ),
+                ApiFormat::Anthropic => format!(
+                    "msg_zenshim-{:x}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0)
+                ),
+            },
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -34,12 +60,20 @@ impl StreamTranslator {
             flushed_text: String::new(),
             emitted_tool_calls: Vec::new(),
             usage: None,
+            truncated: false,
             finished: false,
             tool_call_index: 0,
+            anthropic_message_started: false,
+            anthropic_text_block_open: false,
+            anthropic_block_index: 0,
         }
     }
 
-    fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> String {
+    // ------------------------------------------------------------------
+    // OpenAI rendering
+    // ------------------------------------------------------------------
+
+    fn openai_chunk(&self, delta: Value, finish_reason: Option<&str>) -> String {
         let mut choice = json!({ "index": 0, "delta": delta });
         if let Some(reason) = finish_reason {
             choice["finish_reason"] = json!(reason);
@@ -53,6 +87,85 @@ impl StreamTranslator {
         });
         format!("data: {chunk}\n\n")
     }
+
+    // ------------------------------------------------------------------
+    // Anthropic rendering
+    // ------------------------------------------------------------------
+
+    fn anthropic_event(&self, event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    fn anthropic_ensure_started(&mut self, out: &mut Vec<String>) {
+        if self.anthropic_message_started {
+            return;
+        }
+        self.anthropic_message_started = true;
+        out.push(self.anthropic_event(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": { "input_tokens": self.usage_input(), "output_tokens": 0 },
+                },
+            }),
+        ));
+    }
+
+    fn usage_input(&self) -> u64 {
+        self.usage
+            .as_ref()
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    fn usage_output(&self) -> u64 {
+        self.usage
+            .as_ref()
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    fn anthropic_open_text_block(&mut self, out: &mut Vec<String>) {
+        self.anthropic_ensure_started(out);
+        if self.anthropic_text_block_open {
+            return;
+        }
+        self.anthropic_text_block_open = true;
+        out.push(self.anthropic_event(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": self.anthropic_block_index,
+                "content_block": { "type": "text", "text": "" },
+            }),
+        ));
+    }
+
+    fn anthropic_close_text_block(&mut self, out: &mut Vec<String>) {
+        if !self.anthropic_text_block_open {
+            return;
+        }
+        self.anthropic_text_block_open = false;
+        out.push(self.anthropic_event(
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": self.anthropic_block_index }),
+        ));
+        self.anthropic_block_index += 1;
+    }
+
+    // ------------------------------------------------------------------
+    // Fence holdback (format-agnostic)
+    // ------------------------------------------------------------------
 
     /// How much of the buffer is safe to flush (cannot be part of a fence).
     fn safe_len(&self) -> usize {
@@ -72,7 +185,29 @@ impl StreamTranslator {
         self.buffer.len()
     }
 
-    /// Feed one zen SSE event; returns OpenAI SSE chunks to emit.
+    /// Emit one flushed text delta in the active format.
+    fn emit_text(&mut self, text: &str, out: &mut Vec<String>) {
+        if text.is_empty() {
+            return;
+        }
+        self.flushed_text.push_str(text);
+        match self.format {
+            ApiFormat::OpenAi => out.push(self.openai_chunk(json!({ "content": text }), None)),
+            ApiFormat::Anthropic => {
+                self.anthropic_open_text_block(out);
+                out.push(self.anthropic_event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": self.anthropic_block_index,
+                        "delta": { "type": "text_delta", "text": text },
+                    }),
+                ));
+            }
+        }
+    }
+
+    /// Feed one zen SSE event; returns rendered SSE strings to emit.
     pub fn feed(&mut self, event: &str, data: &str) -> Vec<String> {
         let mut out = Vec::new();
         if self.finished {
@@ -89,12 +224,14 @@ impl StreamTranslator {
                     let safe = self.safe_len();
                     if safe > 0 {
                         let flushed: String = self.buffer.drain(..safe).collect();
-                        self.flushed_text.push_str(&flushed);
-                        out.push(self.chunk(json!({ "content": flushed }), None));
+                        self.emit_text(&flushed, &mut out);
                     }
                 }
             }
             "response.completed" | "response.incomplete" | "response.failed" => {
+                if event != "response.completed" {
+                    self.truncated = true;
+                }
                 if let Some(u) = parsed.pointer("/response/usage") {
                     let input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
                     let output = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
@@ -104,7 +241,7 @@ impl StreamTranslator {
                         "total_tokens": input + output,
                     }));
                 }
-                out.extend(self.finish(if event == "response.completed" { "stop" } else { "stop" }));
+                out.extend(self.finish());
             }
             _ => {}
         }
@@ -112,9 +249,8 @@ impl StreamTranslator {
     }
 
     /// Flush everything: remaining text, parsed tool calls, finish reason.
-    fn finish(&mut self, fallback_reason: &str) -> Vec<String> {
+    fn finish(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        // Extract fenced tool blocks from whatever remains.
         let text = self.buffer.clone();
         let mut rest = text.as_str();
         let mut clean_text = String::new();
@@ -130,7 +266,6 @@ impl StreamTranslator {
                     rest = &after_open[end + 3..];
                 }
                 None => {
-                    // Unterminated fence: drop it.
                     rest = "";
                 }
             }
@@ -138,42 +273,101 @@ impl StreamTranslator {
         clean_text.push_str(rest);
         let clean_text = clean_text.trim().to_string();
         self.clean_text = clean_text.clone();
-        if !clean_text.is_empty() {
-            out.push(self.chunk(json!({ "content": clean_text }), None));
+        self.emit_text(&clean_text, &mut out);
+        if self.format == ApiFormat::Anthropic {
+            self.anthropic_close_text_block(&mut out);
         }
 
         // Emit synthesized tool calls.
         let mut any = false;
         for call in self.emitted_tool_calls.clone() {
             any = true;
-            out.push(self.chunk(
-                json!({ "tool_calls": [{
-                    "index": self.tool_call_index,
-                    "id": call["id"],
-                    "type": "function",
-                    "function": { "name": call["name"], "arguments": call["arguments"] },
-                }]}),
-                None,
-            ));
+            match self.format {
+                ApiFormat::OpenAi => {
+                    out.push(self.openai_chunk(
+                        json!({ "tool_calls": [{
+                            "index": self.tool_call_index,
+                            "id": call["id"],
+                            "type": "function",
+                            "function": { "name": call["name"], "arguments": call["arguments"] },
+                        }]}),
+                        None,
+                    ));
+                }
+                ApiFormat::Anthropic => {
+                    self.anthropic_ensure_started(&mut out);
+                    let index = self.anthropic_block_index;
+                    let id = call["id"].as_str().unwrap_or("call").to_string();
+                    let name = call["name"].as_str().unwrap_or("?").to_string();
+                    out.push(self.anthropic_event(
+                        "content_block_start",
+                        json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} },
+                        }),
+                    ));
+                    out.push(self.anthropic_event(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": { "type": "input_json_delta", "partial_json": call["arguments"] },
+                        }),
+                    ));
+                    out.push(self.anthropic_event(
+                        "content_block_stop",
+                        json!({ "type": "content_block_stop", "index": index }),
+                    ));
+                    self.anthropic_block_index += 1;
+                }
+            }
             self.tool_call_index += 1;
         }
 
-        let reason = if any { "tool_calls" } else { fallback_reason };
-        out.push(self.chunk(json!({}), Some(reason)));
-
-        // Final usage chunk (OpenAI streams end with usage then [DONE]).
-        if let Some(usage) = self.usage.clone() {
-            let chunk = json!({
-                "id": self.id,
-                "object": "chat.completion.chunk",
-                "created": self.created,
-                "model": self.model,
-                "choices": [],
-                "usage": usage,
-            });
-            out.push(format!("data: {chunk}\n\n"));
+        let reason = if self.truncated {
+            "length"
+        } else if any {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        match self.format {
+            ApiFormat::OpenAi => {
+                out.push(self.openai_chunk(json!({}), Some(reason)));
+                if let Some(usage) = self.usage.clone() {
+                    let chunk = json!({
+                        "id": self.id,
+                        "object": "chat.completion.chunk",
+                        "created": self.created,
+                        "model": self.model,
+                        "choices": [],
+                        "usage": usage,
+                    });
+                    out.push(format!("data: {chunk}\n\n"));
+                }
+                out.push("data: [DONE]\n\n".to_string());
+            }
+            ApiFormat::Anthropic => {
+                self.anthropic_ensure_started(&mut out);
+                let stop_reason = if self.truncated {
+                    "max_tokens"
+                } else if any {
+                    "tool_use"
+                } else {
+                    "end_turn"
+                };
+                out.push(self.anthropic_event(
+                    "message_delta",
+                    json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
+                        "usage": { "output_tokens": self.usage_output() },
+                    }),
+                ));
+                out.push(self.anthropic_event("message_stop", json!({ "type": "message_stop" })));
+            }
         }
-        out.push("data: [DONE]\n\n".to_string());
         self.finished = true;
         out
     }
@@ -183,7 +377,7 @@ impl StreamTranslator {
         if self.finished {
             Vec::new()
         } else {
-            self.finish("stop")
+            self.finish()
         }
     }
 
@@ -193,24 +387,60 @@ impl StreamTranslator {
             self.close();
         }
         let content = format!("{}{}", self.flushed_text, self.clean_text).trim().to_string();
-        let mut message = json!({ "role": "assistant", "content": if content.is_empty() { Value::Null } else { json!(content) } });
-        if !self.emitted_tool_calls.is_empty() {
-            message["tool_calls"] = json!(self.emitted_tool_calls);
+        match self.format {
+            ApiFormat::OpenAi => {
+                let mut message =
+                    json!({ "role": "assistant", "content": if content.is_empty() { Value::Null } else { json!(content) } });
+                if !self.emitted_tool_calls.is_empty() {
+                    message["tool_calls"] = json!(self.emitted_tool_calls);
+                }
+                json!({
+                    "id": self.id,
+                    "object": "chat.completion",
+                    "created": self.created,
+                    "model": self.model,
+                    "choices": [{
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": if self.truncated { "length" } else if self.emitted_tool_calls.is_empty() { "stop" } else { "tool_calls" },
+                    }],
+                    "usage": self.usage.clone().unwrap_or(json!({
+                        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                    })),
+                })
+            }
+            ApiFormat::Anthropic => {
+                let mut blocks: Vec<Value> = Vec::new();
+                if !content.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": content }));
+                }
+                for call in &self.emitted_tool_calls {
+                    let input: Value = serde_json::from_str(
+                        call["arguments"].as_str().unwrap_or("{}"),
+                    )
+                    .unwrap_or(json!({}));
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": call["id"],
+                        "name": call["name"],
+                        "input": input,
+                    }));
+                }
+                json!({
+                    "id": self.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": blocks,
+                    "stop_reason": if self.truncated { "max_tokens" } else if self.emitted_tool_calls.is_empty() { "end_turn" } else { "tool_use" },
+                    "stop_sequence": Value::Null,
+                    "usage": {
+                        "input_tokens": self.usage_input(),
+                        "output_tokens": self.usage_output(),
+                    },
+                })
+            }
         }
-        json!({
-            "id": self.id,
-            "object": "chat.completion",
-            "created": self.created,
-            "model": self.model,
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": if self.emitted_tool_calls.is_empty() { "stop" } else { "tool_calls" },
-            }],
-            "usage": self.usage.clone().unwrap_or(json!({
-                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-            })),
-        })
     }
 }
 

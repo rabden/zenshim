@@ -75,11 +75,27 @@ client = OpenAI(base_url="http://127.0.0.1:8480/v1", api_key="sk-zenshim-…")
 
 ### API surface
 
-| Route | Behavior |
-|---|---|
-| `POST /v1/chat/completions` | streaming and non-streaming; `tools` come back as standard `tool_calls` (feed results back as `role:"tool"` messages); `image_url` content parts supported |
-| `GET /v1/models` | the models selected at setup |
-| `GET /health` | liveness |
+zenshim speaks **both** major client dialects, simultaneously by default:
+
+| Route | Dialect | Behavior |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI | streaming + non-streaming; `tools` → standard `tool_calls` (results back as `role:"tool"`); `image_url` parts supported |
+| `POST /v1/messages` | Anthropic | streaming + non-streaming; `tools` → `tool_use` blocks (results back as `tool_result`); base64 `image` sources supported; auth via `x-api-key` or `Bearer` |
+| `GET /v1/models` | OpenAI | the models selected at setup |
+| `GET /health` | — | liveness |
+
+Point Anthropic SDKs at it directly:
+
+```python
+client = Anthropic(base_url="http://127.0.0.1:8480", api_key="sk-zenshim-…")
+client.messages.create(model="muse-spark-1.3-contributor-free", max_tokens=1024,
+                       messages=[{"role": "user", "content": "hi"}])
+```
+
+To serve a single dialect: `--format openai` or `--format anthropic`
+(the other route then returns 404). Note: reasoning models spend output
+tokens on thinking, so the gateway floors `max_tokens` at 1024 and reports
+real truncation as `stop_reason: "max_tokens"` / `finish_reason: "length"`.
 
 ### Key stacking
 
@@ -132,6 +148,7 @@ zenshim --no-tui        disable the interactive console
   --port 8480           listen port
   --host 127.0.0.1      bind address (0.0.0.0 = LAN)
   --tunnel              expose publicly via a cloudflared quick tunnel
+  --format both         API shapes to serve: openai | anthropic | both
 ```
 
 ## How it works
