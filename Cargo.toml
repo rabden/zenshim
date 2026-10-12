@@ -18,10 +18,10 @@ clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
 dialoguer = "0.11"
 anyhow = "1"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 
 [profile.release]
 opt-level = "z"
