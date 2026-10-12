@@ -23,9 +23,9 @@ if [ -z "$DEST" ]; then
     DEST="/usr/local/bin"
   else
     DEST="${HOME}/.local/bin"
-    mkdir -p "$DEST"
   fi
 fi
+mkdir -p "$DEST"
 
 # --- platform detection ----------------------------------------------------
 OS="$(uname -s)"
