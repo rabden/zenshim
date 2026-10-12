@@ -1120,9 +1120,10 @@ mod tests {
         };
         let root = Path::new("/tmp/zenshim-oc-test");
         let env: HashMap<String, String> = sandbox_env(root, "pw", "public", host).into_iter().collect();
+        let rooted = |name: &str| root.join(name).to_string_lossy().into_owned();
         assert_eq!(env["PATH"], "/usr/bin");
-        assert_eq!(env["HOME"], "/tmp/zenshim-oc-test/home");
-        assert_eq!(env["XDG_CONFIG_HOME"], "/tmp/zenshim-oc-test/config");
+        assert_eq!(env["HOME"], rooted("home"));
+        assert_eq!(env["XDG_CONFIG_HOME"], rooted("config"));
         assert!(!env.values().any(|value| value == "secret"));
         assert!(!env.contains_key("OPENCODE_API_KEY"), "anonymous tier sends no key");
 
