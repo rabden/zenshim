@@ -18,7 +18,20 @@ function calling and image input**, transparently translated.
 Single static binary, no runtime, no config files required — start it,
 use it, Ctrl-C it.
 
-## Build
+## Install
+
+One-liner (Linux/macOS):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rabden/zenshim/main/install.sh | sh
+```
+
+Installs the latest release binary to `/usr/local/bin` (or `~/.local/bin`)
+and prints `zenshim <version>`. Windows: download
+`zenshim-x86_64-pc-windows-msvc.zip` from
+[releases](https://github.com/rabden/zenshim/releases).
+
+From source:
 
 ```bash
 cargo build --release
