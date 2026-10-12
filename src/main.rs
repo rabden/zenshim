@@ -1,18 +1,20 @@
+mod clipboard;
 mod config;
-mod console;
+mod hub;
 mod ids;
 mod server;
 mod stream;
 mod translate;
+mod tui;
 mod tunnel;
 mod wizard;
 
 use anyhow::Result;
 use clap::Parser;
 use std::io::IsTerminal;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::tunnel::TunnelUrl;
+use crate::tunnel::{Tunnel, TunnelStatus};
 
 #[derive(Parser)]
 #[command(
@@ -26,7 +28,7 @@ struct Cli {
     #[arg(long)]
     no_wizard: bool,
 
-    /// Disable the interactive console (print summary and serve)
+    /// Disable the full-screen TUI (print a summary and serve)
     #[arg(long)]
     no_tui: bool,
 
@@ -72,6 +74,8 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let http = wizard::http_client()?;
+    let interactive =
+        !cli.no_tui && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
     let mut config = if cli.setup || (cli.no_wizard && config::Config::load().is_none() && cli.keys.is_none()) {
         None
@@ -81,7 +85,17 @@ async fn main() -> Result<()> {
 
     if cli.setup || (config.is_none() && !cli.no_wizard && cli.keys.is_none() && cli.models.is_none()) {
         let port = cli.port;
-        config = Some(wizard::run_wizard(&http, port).await?);
+        config = if interactive {
+            let runtime = tokio::runtime::Handle::current();
+            let setup = tokio::task::block_in_place(|| tui::setup::run(runtime, http.clone(), port))?;
+            let Some(config) = setup else {
+                println!("setup cancelled");
+                return Ok(());
+            };
+            Some(config)
+        } else {
+            Some(wizard::run_wizard(&http, port).await?)
+        };
     }
 
     let mut config = match config {
@@ -135,65 +149,95 @@ async fn main() -> Result<()> {
     }
     config.port = cli.port;
 
-    if cli.tunnel || cli.host != "127.0.0.1" {
-        println!(
-            "warning: the gateway is reachable beyond localhost — the gateway \
-             key is its only protection"
-        );
-    }
-
     let Some(formats) = server::format::ServeFormats::parse(&cli.format) else {
         anyhow::bail!("--format must be one of: openai, anthropic, both");
     };
 
-    println!(
+    // Bind before the TUI takes over the screen so a busy port is a
+    // plain error message.
+    let listener = server::bind(&cli.host, config.port).await?;
+    let state = server::AppState::new(config, &cli.host, formats)?;
+
+    // From here on log lines belong to the TUI's Logs tab.
+    hub::hub().set_tui(interactive);
+    if cli.tunnel || cli.host != "127.0.0.1" {
+        hub::warn(
+            "warning: the gateway is reachable beyond localhost — the gateway \
+             key is its only protection",
+        );
+    }
+    hub::info(format!(
         "serving {} model(s) with {} upstream key(s)",
-        config.models.len(),
-        config.keys.len()
-    );
+        state.models().len(),
+        state.keys().len()
+    ));
 
-    // Optional public tunnel.
-    let tunnel_url: TunnelUrl = Arc::new(Mutex::new(None));
-    let _tunnel_guard = if cli.tunnel {
-        let (guard, url) = tunnel::start(config.port, Arc::clone(&tunnel_url));
-        if url.is_some() {
-            // cloudflared is already connecting; the server binds next.
-        }
-        guard
-    } else {
-        tunnel::TunnelGuard::none()
-    };
+    // Optional public tunnel; the TUI can also start and stop it later.
+    let tunnel = Tunnel::new(state.port);
+    if cli.tunnel {
+        tunnel.start();
+    }
 
-    let base_url = format!("http://127.0.0.1:{}/v1", config.port);
-    let console_state = console::ConsoleState {
-        base_url,
-        gateway_key: config.gateway_key.clone(),
-        models: config.models.clone(),
-        tunnel: Arc::clone(&tunnel_url),
-    };
-
-    // Shutdown: Ctrl-C or the console 'q' command.
+    // Shutdown: Ctrl-C / SIGINT, or quitting the TUI.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let ctrl_c_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        println!("\nshutting down");
+        hub::info("shutting down");
         let _ = ctrl_c_tx.send(true);
     });
 
-    let interactive = !cli.no_tui && std::io::stdin().is_terminal();
-    if interactive {
-        console::spawn(console_state, shutdown_tx);
-    } else {
-        // Give the tunnel a moment to report before printing the summary.
-        for _ in 0..8 {
-            if tunnel_url.lock().unwrap().is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    if !interactive {
+        // Give the tunnel time to come up (or give up) before the summary.
+        while matches!(tunnel.status(), TunnelStatus::Starting(_)) && !*shutdown_rx.borrow() {
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        console::print_plain(&console_state);
+        print_plain(&state, &tunnel);
+        let served = server::serve(listener, state, shutdown_rx).await;
+        tunnel.stop();
+        return served;
     }
 
-    server::serve(config, &cli.host, formats, shutdown_rx).await
+    // The server stopping for any reason also closes the TUI.
+    let server = tokio::spawn({
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        let tx = shutdown_tx.clone();
+        async move {
+            let served = server::serve(listener, state, rx).await;
+            let _ = tx.send(true);
+            served
+        }
+    });
+    let ui = tokio::task::spawn_blocking({
+        let context = tui::Context {
+            state,
+            tunnel: tunnel.clone(),
+            http,
+            runtime: tokio::runtime::Handle::current(),
+            shutdown: shutdown_rx,
+        };
+        move || tui::run(context)
+    });
+    let ui_result = ui.await;
+    hub::hub().set_tui(false);
+    let _ = shutdown_tx.send(true);
+    tunnel.stop();
+    // Open streams can hold graceful shutdown up; don't wait on them forever.
+    let served = tokio::time::timeout(Duration::from_secs(3), server).await;
+    ui_result??;
+    if let Ok(served) = served {
+        served??;
+    }
+    Ok(())
+}
+
+/// Non-interactive summary for pipes/scripts/TTY-less environments.
+fn print_plain(state: &server::AppState, tunnel: &Tunnel) {
+    println!("base url : http://127.0.0.1:{}/v1", state.port);
+    if let Some(url) = tunnel.url() {
+        println!("tunnel   : {url} (public)");
+    }
+    println!("api key  : hidden — saved in the config; pass --gateway-key to override");
+    println!("models   : {}", state.models().join(", "));
 }

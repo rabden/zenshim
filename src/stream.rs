@@ -7,6 +7,15 @@ pub enum ApiFormat {
     Anthropic,
 }
 
+impl ApiFormat {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 /// Core accumulator over a Zen Responses-API SSE stream. Renders either
 /// OpenAI chat.completion chunks or Anthropic Messages events, and
 /// synthesizes tool calls from fenced ```tool blocks in the text.
@@ -379,6 +388,28 @@ impl StreamTranslator {
         } else {
             self.finish()
         }
+    }
+
+    /// False until upstream sent its completion event (or `close` ran).
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Finish reason, (input, output) token usage and tool-call count,
+    /// for the activity log.
+    pub fn outcome(&self) -> (&'static str, Option<(u64, u64)>, usize) {
+        let reason = if self.truncated {
+            "length"
+        } else if self.emitted_tool_calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        let usage = self
+            .usage
+            .as_ref()
+            .map(|_| (self.usage_input(), self.usage_output()));
+        (reason, usage, self.emitted_tool_calls.len())
     }
 
     /// Final assembled message for non-streaming responses.

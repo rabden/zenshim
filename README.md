@@ -48,14 +48,9 @@ First run starts an interactive setup:
 
 1. paste your Zen API keys (or leave blank for the anonymous free tier),
 2. keys are validated live against the catalog,
-3. pick which free models to serve (all `-free` models preselected),
-4. done — it prints the endpoint and a generated gateway key:
-
-```
-serving 9 model(s) with 1 upstream key(s)
-zenshim listening on http://127.0.0.1:8480/v1
-gateway key: sk-zenshim-3f9a…
-```
+3. pick which models to serve (all `-free` models preselected),
+4. done — the dashboard opens with the endpoints and a generated gateway
+   key (`k` copies it).
 
 Then from anything that speaks OpenAI:
 
@@ -101,25 +96,38 @@ real truncation as `stop_reason: "max_tokens"` / `finish_reason: "length"`.
 
 Pass multiple upstream keys (comma-separated in the wizard, or
 `--keys k1,k2,…`). On `402`/`429` from Zen the gateway rotates to the
-next key and retries; exhausted keys are skipped until restart.
+next key and retries. Add or remove keys while running from the Keys tab.
 
-### Console
+### The app
 
-While running, zenshim offers an interactive console (in a terminal):
+In a terminal, zenshim runs as a full-screen app (built on
+[ratatui](https://ratatui.rs)) with five tabs — `Tab`, `←→` or `1`-`5`
+switch between them:
+
+| Tab | What it shows | Keys |
+|---|---|---|
+| **Dashboard** | endpoints, tunnel state, gateway key, live traffic (totals, tokens, average time, requests/second) and recent requests | |
+| **Requests** | every request with status, dialect, model, client, tokens and duration; the selected one in detail, including the error or finish reason | `f` filter all/errors/active, `x` clear |
+| **Models** | the live catalog with what is served and per-model usage | `Space` serve on/off, `Enter` copy id, `a` copy all served ids, `/` search, `f` free tier/whole catalog, `r` refresh |
+| **Keys** | upstream keys with served / rate-limited / failed counts, and the gateway key | `a` add (validated first), `d` remove, `v` validate |
+| **Logs** | gateway, tunnel and error messages | `↑↓` scroll, `G` follow |
+
+Available everywhere:
 
 ```
-zenshim> k    copy the API key to the clipboard
-zenshim> K    reveal the API key on screen
-zenshim> m    list served models, pick one to copy its model id ('a' copies all)
-zenshim> u    copy the base URL
-zenshim> t    copy the tunnel URL (when --tunnel is active)
-zenshim> s    reprint the summary
-zenshim> q    shut down
+k / K    copy the gateway API key / reveal or hide it
+u / U    copy the OpenAI base URL / the Anthropic base URL
+t / T    copy the tunnel URL / start or stop the tunnel
+R        rotate the gateway key
+?        all keys
+q        shut down (also Ctrl-C)
 ```
 
-The key stays off screen by default; values go straight to the clipboard
-(xclip/xsel/wl-copy/pbcopy). Non-terminal runs (pipes, services) get a
-plain summary instead.
+Changes made in the app — models served, upstream keys, a rotated
+gateway key — apply immediately, without a restart, and are saved to the
+config file. The key stays off screen by default; values go straight to
+the clipboard (xclip/xsel/wl-copy/pbcopy). Non-terminal runs (pipes,
+services) and `--no-tui` get a plain summary and log lines instead.
 
 ### Going public
 
@@ -127,7 +135,7 @@ plain summary instead.
 zenshim --tunnel
 ```
 
-Starts a free cloudflared quick tunnel (no account; `cloudflared` is
+(or press `T` in the app.) Starts a free cloudflared quick tunnel (no account; `cloudflared` is
 auto-downloaded to `~/.local/share/zenshim/` on first use) and prints a public `https://…trycloudflare.com`
 URL that routes to your local gateway — use it as the base URL from
 anywhere. The gateway key is the only protection on that URL; rotate
@@ -140,7 +148,7 @@ reverse proxy in front: `zenshim --host 0.0.0.0 --port 8480`.
 zenshim                 interactive start (wizard on first run)
 zenshim --setup         re-run the wizard
 zenshim --no-wizard     non-interactive: flags/env only
-zenshim --no-tui        disable the interactive console
+zenshim --no-tui        plain output instead of the full-screen app
   --keys k1,k2          upstream keys ("public" = anonymous)
   --models a,b          models to serve (default: all -free)
   --all-models          serve the full live catalog

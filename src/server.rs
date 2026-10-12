@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     body::Body,
@@ -14,6 +14,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use futures_util::StreamExt as _;
 
 use crate::config::Config;
+use crate::hub::{self, Outcome, RequestInfo, Tracker};
 use crate::ids;
 
 use crate::stream::{ApiFormat as StreamFormat, StreamTranslator};
@@ -51,10 +52,39 @@ pub mod format {
     }
 }
 
+/// One upstream Zen key and how it has fared since startup.
+#[derive(Debug, Clone)]
+pub struct UpstreamKey {
+    pub value: String,
+    pub served: u64,
+    /// 402/429 responses (quota or rate limit).
+    pub limited: u64,
+    pub failed: u64,
+    pub last_error: Option<String>,
+}
+
+impl UpstreamKey {
+    pub fn new(value: String) -> Self {
+        Self {
+            value,
+            served: 0,
+            limited: 0,
+            failed: 0,
+            last_error: None,
+        }
+    }
+}
+
 pub struct AppState {
-    pub config: Config,
     pub http: reqwest::Client,
     pub formats: format::ServeFormats,
+    pub host: String,
+    pub port: u16,
+    /// Model ids served; editable while running.
+    pub models: RwLock<Vec<String>>,
+    pub keys: RwLock<Vec<UpstreamKey>>,
+    /// Key clients must present to this gateway.
+    pub gateway_key: RwLock<String>,
     /// Round-robin index over keys; advances on exhaustion.
     pub key_cursor: std::sync::atomic::AtomicUsize,
     /// Stable zen session per client conversation (hash of first user text).
@@ -62,6 +92,59 @@ pub struct AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+impl AppState {
+    pub fn new(config: Config, host: &str, formats: format::ServeFormats) -> anyhow::Result<SharedState> {
+        Ok(Arc::new(AppState {
+            http: http_client()?,
+            formats,
+            host: host.to_string(),
+            port: config.port,
+            models: RwLock::new(config.models),
+            keys: RwLock::new(config.keys.into_iter().map(UpstreamKey::new).collect()),
+            gateway_key: RwLock::new(config.gateway_key),
+            key_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }))
+    }
+
+    pub fn models(&self) -> Vec<String> {
+        self.models.read().unwrap().clone()
+    }
+
+    pub fn keys(&self) -> Vec<UpstreamKey> {
+        self.keys.read().unwrap().clone()
+    }
+
+    pub fn gateway_key(&self) -> String {
+        self.gateway_key.read().unwrap().clone()
+    }
+
+    pub fn config(&self) -> Config {
+        Config {
+            keys: self.keys().into_iter().map(|k| k.value).collect(),
+            models: self.models(),
+            port: self.port,
+            gateway_key: self.gateway_key(),
+        }
+    }
+
+    /// Write a runtime edit back to the config file. `apply` copies the
+    /// edited field from the live config onto the saved one, so one-off
+    /// flag overrides of other fields are not persisted along with it.
+    pub fn persist(&self, apply: impl FnOnce(&mut Config, Config)) -> anyhow::Result<()> {
+        let live = self.config();
+        let mut saved = Config::load().unwrap_or_else(|| live.clone());
+        apply(&mut saved, live);
+        saved.save()
+    }
+
+    fn note_key(&self, value: &str, apply: impl FnOnce(&mut UpstreamKey)) {
+        if let Some(key) = self.keys.write().unwrap().iter_mut().find(|k| k.value == value) {
+            apply(key);
+        }
+    }
+}
 
 pub fn router(state: SharedState) -> Router {
     Router::new()
@@ -93,8 +176,37 @@ fn error_anthropic(status: StatusCode, err_type: &str, message: &str) -> Respons
         .into_response()
 }
 
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "authentication_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        _ => "api_error",
+    }
+}
+
+/// An error in the shape the dialect's clients expect.
+fn reject(format: StreamFormat, status: StatusCode, message: &str) -> Response {
+    match format {
+        StreamFormat::OpenAi => error_json(status, message),
+        StreamFormat::Anthropic => error_anthropic(status, anthropic_error_type(status), message),
+    }
+}
+
+/// Who is calling: the real client address when behind the tunnel or a
+/// reverse proxy, otherwise local.
+fn client_of(headers: &HeaderMap) -> String {
+    ["cf-connecting-ip", "x-forwarded-for"]
+        .iter()
+        .find_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
 fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    let expected = &state.config.gateway_key;
+    let expected = &state.gateway_key();
     if expected.is_empty() {
         return true;
     }
@@ -134,8 +246,7 @@ async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Re
         return error_json(StatusCode::UNAUTHORIZED, "invalid gateway key");
     }
     let data: Vec<Value> = state
-        .config
-        .models
+        .models()
         .iter()
         .map(|id| {
             json!({
@@ -155,17 +266,20 @@ async fn dispatch_upstream(
     state: &AppState,
     zen_body: &Value,
     session: &str,
-) -> Result<reqwest::Response, Response> {
+    tracker: &Tracker,
+) -> Result<reqwest::Response, (StatusCode, String)> {
     let mut last_error = String::new();
-    let total_keys = state.config.keys.len();
+    // Keys can be edited while this request is in flight; work on a snapshot.
+    let keys: Vec<String> = state.keys().into_iter().map(|k| k.value).collect();
+    let total_keys = keys.len();
     let start = state.key_cursor.load(std::sync::atomic::Ordering::SeqCst);
     for attempt in 0..total_keys {
         let index = (start + attempt) % total_keys;
-        let key = state.config.keys[index].clone();
+        let key = &keys[index];
         let send = state
             .http
             .post(format!("{UPSTREAM_BASE}/responses"))
-            .bearer_auth(&key)
+            .bearer_auth(key)
             .header("User-Agent", ZEN_USER_AGENT)
             .header("x-opencode-client", "cli")
             .header("x-opencode-project", "global")
@@ -182,6 +296,8 @@ async fn dispatch_upstream(
                     state
                         .key_cursor
                         .store((index + 1) % total_keys.max(1), std::sync::atomic::Ordering::SeqCst);
+                    state.note_key(key, |k| k.served += 1);
+                    tracker.key(index);
                     return Ok(response);
                 }
                 if status.as_u16() == 402 || status.as_u16() == 429 {
@@ -190,29 +306,55 @@ async fn dispatch_upstream(
                         "key {index} exhausted ({status}): {}",
                         body_text.chars().take(160).collect::<String>()
                     );
+                    state.note_key(key, |k| {
+                        k.limited += 1;
+                        k.last_error = Some(last_error.clone());
+                    });
+                    hub::warn(format!("upstream {last_error}"));
                     continue;
                 }
                 let body_text = response.text().await.unwrap_or_default();
-                return Err(error_json(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("zen returned {status}: {}", body_text.chars().take(400).collect::<String>()),
-                ));
+                let message = format!(
+                    "zen returned {status}: {}",
+                    body_text.chars().take(400).collect::<String>()
+                );
+                state.note_key(key, |k| {
+                    k.failed += 1;
+                    k.last_error = Some(message.clone());
+                });
+                return Err((StatusCode::BAD_GATEWAY, message));
             }
             Err(e) => {
                 last_error = format!("upstream request failed: {e}");
+                state.note_key(key, |k| {
+                    k.failed += 1;
+                    k.last_error = Some(last_error.clone());
+                });
             }
         }
     }
-    Err(error_json(
+    Err((
         StatusCode::TOO_MANY_REQUESTS,
-        &format!("all keys exhausted or unreachable. last error: {last_error}"),
+        format!("all keys exhausted or unreachable. last error: {last_error}"),
     ))
+}
+
+/// What the translator saw, as the activity log records it.
+fn outcome_of(translator: &StreamTranslator, completed: bool) -> Outcome {
+    let (reason, usage, tool_calls) = translator.outcome();
+    Outcome {
+        status: 200,
+        note: if completed { reason.to_string() } else { "upstream stream ended early".to_string() },
+        usage,
+        tool_calls,
+    }
 }
 
 /// Pump the zen SSE stream through a StreamTranslator into a channel.
 fn spawn_translation_task(
     response: reqwest::Response,
     mut translator: StreamTranslator,
+    tracker: Tracker,
 ) -> Body {
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
@@ -226,16 +368,19 @@ fn spawn_translation_task(
                 let (event, data) = parse_sse_block(&block);
                 for out in translator.feed(&event, &data) {
                     if tx.send(out).is_err() {
+                        // Client went away; dropping the tracker records it.
                         return;
                     }
                 }
             }
         }
+        let completed = translator.is_finished();
         for out in translator.close() {
             if tx.send(out).is_err() {
                 return;
             }
         }
+        tracker.finish(outcome_of(&translator, completed));
     });
     Body::from_stream(
         UnboundedReceiverStream::new(rx).map(|chunk| Ok::<String, std::convert::Infallible>(chunk)),
@@ -247,63 +392,7 @@ async fn chat_completions(
     headers: HeaderMap,
     body: axum::extract::Json<Value>,
 ) -> Response {
-    if !state.formats.serves(StreamFormat::OpenAi) {
-        return error_json(StatusCode::NOT_FOUND, "openai format not served (see --format)");
-    }
-    if !authorized(&state, &headers) {
-        return error_json(StatusCode::UNAUTHORIZED, "invalid gateway key");
-    }
-    let request = body.0;
-
-    let requested = request.get("model").and_then(Value::as_str).unwrap_or_default();
-    let Some(zen_model) = resolve_model(requested, &state.config.models) else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            &format!(
-                "model '{requested}' is not served. Available: {}",
-                state.config.models.join(", ")
-            ),
-        );
-    };
-
-    let zen_body = build_zen_body(&request, &zen_model);
-    let fingerprint = conversation_fingerprint(&request);
-    let session = {
-        let mut sessions = state.sessions.lock().unwrap();
-        sessions.entry(fingerprint).or_insert_with(ids::session_id).clone()
-    };
-
-    let upstream = match dispatch_upstream(&state, &zen_body, &session).await {
-        Ok(response) => response,
-        Err(error) => return error,
-    };
-
-    let stream_requested = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let translator = StreamTranslator::new(StreamFormat::OpenAi, requested.to_string());
-
-    if !stream_requested {
-        let mut translator = translator;
-        let mut sse_buffer = String::new();
-        let mut stream = upstream.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let Ok(bytes) = chunk else { break };
-            sse_buffer.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(split) = sse_buffer.find("\n\n") {
-                let block: String = sse_buffer.drain(..split + 2).collect();
-                let (event, data) = parse_sse_block(&block);
-                translator.feed(&event, &data);
-            }
-        }
-        return Json(translator.into_completion()).into_response();
-    }
-
-    let body = spawn_translation_task(upstream, translator);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(body)
-        .unwrap()
+    handle(state, headers, body.0, StreamFormat::OpenAi).await
 }
 
 async fn anthropic_messages(
@@ -311,52 +400,63 @@ async fn anthropic_messages(
     headers: HeaderMap,
     body: axum::extract::Json<Value>,
 ) -> Response {
-    if !state.formats.serves(StreamFormat::Anthropic) {
-        return error_anthropic(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            "anthropic format not served (see --format)",
-        );
-    }
-    if !authorized(&state, &headers) {
-        return error_anthropic(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "invalid gateway key",
-        );
-    }
-    let request = body.0;
+    handle(state, headers, body.0, StreamFormat::Anthropic).await
+}
 
+/// The request path both dialects share; `format` picks the body
+/// translation and the response/error shapes.
+async fn handle(state: SharedState, headers: HeaderMap, request: Value, format: StreamFormat) -> Response {
     let requested = request.get("model").and_then(Value::as_str).unwrap_or_default();
-    let Some(zen_model) = resolve_model(requested, &state.config.models) else {
-        return error_anthropic(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            &format!(
-                "model: '{}' is not served. Available: {}",
-                state.config.models.join(", "),
-                requested
-            ),
-        );
+    let stream_requested = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let count = |field: &str| request.get(field).and_then(Value::as_array).map_or(0, Vec::len);
+    let tracker = hub::hub().begin(RequestInfo {
+        format,
+        model: requested.to_string(),
+        client: client_of(&headers),
+        stream: stream_requested,
+        messages: count("messages"),
+        tools: count("tools"),
+    });
+    let fail = |tracker: Tracker, status: StatusCode, message: &str| {
+        tracker.finish(Outcome::error(status.as_u16(), message));
+        reject(format, status, message)
     };
 
-    let zen_body = build_zen_body_anthropic(&request, &zen_model);
+    if !state.formats.serves(format) {
+        let message = format!("{} format not served (see --format)", format.label());
+        return fail(tracker, StatusCode::NOT_FOUND, &message);
+    }
+    if !authorized(&state, &headers) {
+        return fail(tracker, StatusCode::UNAUTHORIZED, "invalid gateway key");
+    }
+
+    let models = state.models();
+    let Some(zen_model) = resolve_model(requested, &models) else {
+        let message = format!(
+            "model '{requested}' is not served. Available: {}",
+            models.join(", ")
+        );
+        return fail(tracker, StatusCode::NOT_FOUND, &message);
+    };
+
+    let zen_body = match format {
+        StreamFormat::OpenAi => build_zen_body(&request, &zen_model),
+        StreamFormat::Anthropic => build_zen_body_anthropic(&request, &zen_model),
+    };
     let fingerprint = conversation_fingerprint(&request);
     let session = {
         let mut sessions = state.sessions.lock().unwrap();
         sessions.entry(fingerprint).or_insert_with(ids::session_id).clone()
     };
 
-    let upstream = match dispatch_upstream(&state, &zen_body, &session).await {
+    let upstream = match dispatch_upstream(&state, &zen_body, &session, &tracker).await {
         Ok(response) => response,
-        Err(error) => return error,
+        Err((status, message)) => return fail(tracker, status, &message),
     };
 
-    let stream_requested = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let translator = StreamTranslator::new(StreamFormat::Anthropic, requested.to_string());
+    let mut translator = StreamTranslator::new(format, requested.to_string());
 
     if !stream_requested {
-        let mut translator = translator;
         let mut sse_buffer = String::new();
         let mut stream = upstream.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -368,10 +468,13 @@ async fn anthropic_messages(
                 translator.feed(&event, &data);
             }
         }
+        let completed = translator.is_finished();
+        translator.close();
+        tracker.finish(outcome_of(&translator, completed));
         return Json(translator.into_completion()).into_response();
     }
 
-    let body = spawn_translation_task(upstream, translator);
+    let body = spawn_translation_task(upstream, translator, tracker);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
@@ -393,26 +496,22 @@ fn parse_sse_block(block: &str) -> (String, String) {
     (event, data)
 }
 
+pub async fn bind(host: &str, port: u16) -> anyhow::Result<tokio::net::TcpListener> {
+    let addr = format!("{host}:{port}");
+    tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))
+}
+
 pub async fn serve(
-    config: Config,
-    host: &str,
-    formats: format::ServeFormats,
+    listener: tokio::net::TcpListener,
+    state: SharedState,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let state = Arc::new(AppState {
-        http: http_client()?,
-        formats,
-        key_cursor: std::sync::atomic::AtomicUsize::new(0),
-        sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
-        config,
-    });
-    let addr = format!("{host}:{}", state.config.port);
-    let app = router(state.clone());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("zenshim listening on http://{addr}");
-    axum::serve(listener, app)
+    hub::info(format!("zenshim listening on http://{}:{}", state.host, state.port));
+    axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
+            let _ = shutdown.wait_for(|stop| *stop).await;
         })
         .await?;
     Ok(())
