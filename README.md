@@ -111,8 +111,8 @@ plain summary instead.
 zenshim --tunnel
 ```
 
-Starts a free cloudflared quick tunnel (requires the `cloudflared`
-binary, no account) and prints a public `https://…trycloudflare.com`
+Starts a free cloudflared quick tunnel (no account; `cloudflared` is
+auto-downloaded to `~/.local/share/zenshim/` on first use) and prints a public `https://…trycloudflare.com`
 URL that routes to your local gateway — use it as the base URL from
 anywhere. The gateway key is the only protection on that URL; rotate
 it with `--gateway-key`. For your own domain, bind on LAN and put your

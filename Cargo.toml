@@ -1,6 +1,6 @@
 [package]
 name = "zenshim"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "OpenAI-compatible local gateway for OpenCode Zen's free tier"
 license = "MIT"
@@ -10,7 +10,7 @@ axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = "0.1"
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.9"
