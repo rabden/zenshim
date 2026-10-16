@@ -1127,10 +1127,10 @@ fn dsml_marker(s: &str, from: usize, closing: bool, word: &str) -> Option<(usize
     let bytes = s.as_bytes();
     let mut i = from;
     while i < bytes.len() {
-        if bytes[i] == b'<' {
-            if let Some((end, name)) = dsml_marker_at(s, i, closing, word) {
-                return Some((i, end, name));
-            }
+        if bytes[i] == b'<'
+            && let Some((end, name)) = dsml_marker_at(s, i, closing, word)
+        {
+            return Some((i, end, name));
         }
         i += 1;
     }
