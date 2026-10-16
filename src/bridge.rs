@@ -387,10 +387,10 @@ impl Backend {
             let body = json!({ "decision": "reject", "message": TOOL_REJECTION });
             let reply = backend.request(reqwest::Method::POST, &path).json(&body);
             // 404: already answered, which is all that matters.
-            if let Err((status, message)) = backend.json(reply.timeout(Duration::from_secs(5))).await {
-                if status != 404 {
-                    hub::warn(format!("cli: could not refuse an OpenCode tool request: {message}"));
-                }
+            if let Err((status, message)) = backend.json(reply.timeout(Duration::from_secs(5))).await
+                && status != 404
+            {
+                hub::warn(format!("cli: could not refuse an OpenCode tool request: {message}"));
             }
         });
     }
@@ -434,10 +434,10 @@ impl Backend {
             let backend = Arc::clone(self);
             tokio::spawn(async move { backend.sweep_pending().await });
         }
-        if let Some(session) = session {
-            if let Some(listener) = self.sessions.lock().unwrap().get(&session) {
-                let _ = listener.send(event);
-            }
+        if let Some(session) = session
+            && let Some(listener) = self.sessions.lock().unwrap().get(&session)
+        {
+            let _ = listener.send(event);
         }
     }
 

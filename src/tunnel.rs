@@ -39,10 +39,10 @@ fn cloudflared_exists_on_path() -> bool {
 /// Resolve a cloudflared binary: env override → PATH → cached copy →
 /// download from the official release into the cache (auto-install).
 fn resolve_cloudflared(progress: &dyn Fn(String)) -> Option<PathBuf> {
-    if let Some(path) = cloudflared_cache_path() {
-        if path.exists() {
-            return Some(path);
-        }
+    if let Some(path) = cloudflared_cache_path()
+        && path.exists()
+    {
+        return Some(path);
     }
     if cloudflared_exists_on_path() {
         return Some(PathBuf::from("cloudflared"));

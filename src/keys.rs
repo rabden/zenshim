@@ -348,11 +348,11 @@ impl KeyPool {
                 }
             }
         }
-        if ready.is_empty() {
-            if let Some((_, attempt)) = resting.into_iter().min_by_key(|(due, _)| *due) {
-                keys[attempt.index].route_mut(attempt.route).last_probe = Some(now);
-                ready.push(attempt);
-            }
+        if ready.is_empty()
+            && let Some((_, attempt)) = resting.into_iter().min_by_key(|(due, _)| *due)
+        {
+            keys[attempt.index].route_mut(attempt.route).last_probe = Some(now);
+            ready.push(attempt);
         }
         ready
     }

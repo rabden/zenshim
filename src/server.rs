@@ -82,10 +82,10 @@ impl SessionCache {
         if let Some(id) = self.ids.get(&fingerprint) {
             return id.clone();
         }
-        if self.order.len() >= MAX_SESSIONS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.ids.remove(&oldest);
-            }
+        if self.order.len() >= MAX_SESSIONS
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.ids.remove(&oldest);
         }
         let id = create();
         self.ids.insert(fingerprint, id.clone());
@@ -241,10 +241,10 @@ fn reject(format: StreamFormat, status: StatusCode, message: &str) -> Response {
 
 /// Add `Retry-After` so well-behaved clients back off by themselves.
 fn with_retry_after(mut response: Response, wait: Option<Duration>) -> Response {
-    if let Some(wait) = wait {
-        if let Ok(value) = wait.as_secs().max(1).to_string().parse() {
-            response.headers_mut().insert("retry-after", value);
-        }
+    if let Some(wait) = wait
+        && let Ok(value) = wait.as_secs().max(1).to_string().parse()
+    {
+        response.headers_mut().insert("retry-after", value);
     }
     response
 }
@@ -727,14 +727,14 @@ async fn handle(
         return fail(tracker, StatusCode::NOT_FOUND, &message, None);
     }
     // Before the key check, so guessing keys is rate limited too.
-    if !local {
-        if let Err(wait) = state.rate.check(client, started) {
-            let message = format!(
-                "rate limit of {} requests per minute reached; retry shortly",
-                state.limits.rate_per_minute
-            );
-            return fail(tracker, StatusCode::TOO_MANY_REQUESTS, &message, Some(wait));
-        }
+    if !local
+        && let Err(wait) = state.rate.check(client, started)
+    {
+        let message = format!(
+            "rate limit of {} requests per minute reached; retry shortly",
+            state.limits.rate_per_minute
+        );
+        return fail(tracker, StatusCode::TOO_MANY_REQUESTS, &message, Some(wait));
     }
     if !authorized(&state, &headers) {
         return fail(tracker, StatusCode::UNAUTHORIZED, "invalid gateway key", None);
@@ -849,7 +849,7 @@ fn spawn_translation_task(
         }
     });
     Body::from_stream(
-        UnboundedReceiverStream::new(rx).map(|chunk| Ok::<String, std::convert::Infallible>(chunk)),
+        UnboundedReceiverStream::new(rx).map(Ok::<String, std::convert::Infallible>),
     )
 }
 

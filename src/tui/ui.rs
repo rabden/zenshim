@@ -426,10 +426,9 @@ fn draw_traffic(frame: &mut Frame, area: Rect) {
     };
     let active = totals.requests - totals.completed;
     let error_style = if totals.errors > 0 { Style::new().fg(BAD) } else { bold() };
-    let average = if totals.ok > 0 {
-        fmt_duration(Duration::from_millis(totals.ok_millis / totals.ok))
-    } else {
-        "—".to_string()
+    let average = match totals.ok_millis.checked_div(totals.ok) {
+        Some(millis) => fmt_duration(Duration::from_millis(millis)),
+        None => "—".to_string(),
     };
     let mut first = stat("requests", fmt_count(totals.requests), bold());
     first.extend(stat("live", active.to_string(), bold()));
