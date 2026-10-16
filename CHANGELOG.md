@@ -15,6 +15,14 @@
 - Text that follows a closed tool block now streams live instead of
   being held back until the end of the response.
 
+### Fixed
+- DeepSeek models sometimes ignore the fence protocol and emit their
+  native DSML tool markup (`<｜｜DSML｜｜ calls>…`) as plain text, ending
+  the turn without running anything. The fence pump now recognizes DSML
+  blocks — earliest marker wins against ```tool fences, multiple
+  invokes harvest as parallel calls, partial openers are held back, and
+  malformed markup stays visible for self-correction.
+
 ### Added
 - **Dual-protocol upstream**: zen now serves every free model on the
   endpoint it actually lives on — chat-native frees

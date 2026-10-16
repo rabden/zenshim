@@ -501,6 +501,17 @@ impl StreamTranslator {
                 return bytes.len() - hold;
             }
         }
+        // A partial DSML opener at the tail ("<｜", "<｜｜DS", …) is held
+        // until it is clear whether a block starts.
+        const DSML_OPEN: &str = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>";
+        let tail: Vec<char> = self.buffer.chars().rev().collect();
+        let open: Vec<char> = DSML_OPEN.chars().collect();
+        for hold in (2..=open.len().min(tail.len())).rev() {
+            if tail[..hold] == open[..hold].iter().rev().copied().collect::<Vec<char>>() {
+                let held_bytes: usize = tail[..hold].iter().map(|c| c.len_utf8()).sum();
+                return self.buffer.len() - held_bytes;
+            }
+        }
         bytes.len()
     }
 
@@ -512,18 +523,53 @@ impl StreamTranslator {
     /// unclosed or malformed remainder is kept as text too.
     fn pump(&mut self, final_flush: bool, out: &mut Vec<String>) {
         loop {
-            let Some(open) = self.buffer.find(FENCE_OPEN) else {
-                // No fence opener: flush what cannot grow into one.
-                let safe = if final_flush { self.buffer.len() } else { self.safe_tail() };
-                if safe > 0 {
-                    let flushed: String = self.buffer.drain(..safe).collect();
-                    self.emit_text(&flushed, out);
+            // Earliest tool-call marker wins: a ```tool fence or a DSML
+            // block opener, whichever comes first in the buffer.
+            let fence = self.buffer.find(FENCE_OPEN);
+            let dsml = dsml_marker(&self.buffer, 0, false, "calls").map(|(start, _, _)| start);
+            let open_is_dsml = match (fence, dsml) {
+                (Some(f), Some(d)) => d < f,
+                (None, Some(_)) => true,
+                (None, None) => {
+                    // No opener: flush what cannot grow into one.
+                    let safe = if final_flush { self.buffer.len() } else { self.safe_tail() };
+                    if safe > 0 {
+                        let flushed: String = self.buffer.drain(..safe).collect();
+                        self.emit_text(&flushed, out);
+                    }
+                    return;
                 }
-                return;
+                (Some(_), None) => false,
             };
+            let open = if open_is_dsml { dsml } else { fence };
+            let open = open.unwrap_or(0);
             if open > 0 {
                 let pre: String = self.buffer.drain(..open).collect();
                 self.emit_text(&pre, out);
+            }
+            if open_is_dsml {
+                let (_, open_end, _) = dsml_marker(&self.buffer, 0, false, "calls").unwrap();
+                match dsml_marker(&self.buffer, open_end, true, "calls") {
+                    Some((_, close_end, _)) => {
+                        let block: String = self.buffer.drain(..close_end).collect();
+                        let dsml_calls = parse_dsml_block(&block);
+                        if dsml_calls.is_empty() {
+                            // Not parseable: keep it visible as text.
+                            self.emit_text(&block, out);
+                        } else {
+                            self.emitted_tool_calls.extend(dsml_calls);
+                        }
+                    }
+                    // Incomplete DSML block: hold; the final flush decides.
+                    None => {
+                        if final_flush {
+                            let rest: String = self.buffer.drain(..).collect();
+                            self.emit_text(&rest, out);
+                        }
+                        return;
+                    }
+                }
+                continue;
             }
             match scan_tool_block(&self.buffer, FENCE_OPEN.len()) {
                 Some((payload, end)) => {
@@ -991,6 +1037,153 @@ fn parse_tool_block(payload: &str) -> Option<Value> {
     }))
 }
 
+// -----------------------------------------------------------------------------
+// DeepSeek's native DSML tool markup, emitted as text when the model
+// ignores the fence protocol (observed live 2026-10-16):
+//   <｜｜DSML｜｜ calls>
+//   <｜｜DSML｜｜ invoke name="bash">
+//   <｜｜DSML｜｜ parameter name="command" string="true">echo hi</｜｜DSML｜｜ parameter>
+//   </｜｜DSML｜｜ invoke>
+//   </｜｜DSML｜｜ calls>
+// The special-token bars arrive fullwidth; any bar flavour and count is
+// tolerated. Hand-scanned (no regex dependency).
+// -----------------------------------------------------------------------------
+
+fn skip_bars(s: &str, mut pos: usize) -> usize {
+    while let Some(ch) = s[pos..].chars().next() {
+        if ch == '\u{FF5C}' || ch == '|' || ch == '\u{2502}' {
+            pos += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+fn skip_ws(s: &str, mut pos: usize) -> usize {
+    while let Some(ch) = s[pos..].chars().next() {
+        if ch == ' ' || ch == '\t' {
+            pos += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// The byte just past a `<…DSML… word [attrs]>` marker starting at `at`,
+/// plus the value of its `name="…"` attribute when present.
+fn dsml_marker_at(s: &str, at: usize, closing: bool, word: &str) -> Option<(usize, Option<String>)> {
+    let mut pos = at + 1;
+    if closing {
+        if s[pos..].starts_with('/') {
+            pos += 1;
+        } else {
+            return None;
+        }
+    }
+    pos = skip_bars(s, pos);
+    if !s[pos..].starts_with("DSML") {
+        return None;
+    }
+    pos += 4;
+    pos = skip_bars(s, pos);
+    pos = skip_ws(s, pos);
+    if !s[pos..].starts_with(word) {
+        return None;
+    }
+    pos += word.len();
+    pos = skip_ws(s, pos);
+    // Optional attributes up to the tag's '>' (values are quoted, so a
+    // '>' inside one would already be exotic).
+    let mut name = None;
+    let mut rest = &s[pos..];
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        if let Some(after) = rest.strip_prefix('>') {
+            // after starts just past the '>': that offset is the end.
+            return Some((s.len() - after.len(), name));
+        }
+        if let Some(after) = rest.strip_prefix("name=\"") {
+            let end = after.find('"')?;
+            name = Some(after[..end].to_string());
+            rest = &after[end + 1..];
+            continue;
+        }
+        // Skip any other attribute up to the next space or quote run.
+        let skip = rest.find([' ', '\t', '>']).map_or(rest.len(), |i| i);
+        if skip == 0 {
+            return None;
+        }
+        rest = &rest[skip..];
+        if rest.is_empty() {
+            return None;
+        }
+    }
+}
+
+/// First `<…DSML… word …>` marker at or after `from`.
+fn dsml_marker(s: &str, from: usize, closing: bool, word: &str) -> Option<(usize, usize, Option<String>)> {
+    let bytes = s.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some((end, name)) = dsml_marker_at(s, i, closing, word) {
+                return Some((i, end, name));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse one complete DSML block into tool calls (empty when malformed).
+fn parse_dsml_block(block: &str) -> Vec<Value> {
+    let mut calls = Vec::new();
+    let mut search = 0;
+    while let Some((invoke_start, tag_end, name)) = dsml_marker(block, search, false, "invoke") {
+        let Some((close_start, close_end, _)) = dsml_marker(block, tag_end, true, "invoke") else {
+            break;
+        };
+        let Some(name) = name else {
+            search = close_end;
+            continue;
+        };
+        let body = &block[tag_end..close_start];
+        let mut args = serde_json::Map::new();
+        let mut param_search = 0;
+        while let Some((_, ptag_end, Some(key))) = dsml_marker(body, param_search, false, "parameter") {
+            let Some((pclose_start, pclose_end, _)) = dsml_marker(body, ptag_end, true, "parameter") else {
+                break;
+            };
+            let raw = body[ptag_end..pclose_start].to_string();
+            let trimmed = raw.trim();
+            let value = match trimmed {
+                "true" => json!(true),
+                "false" => json!(false),
+                other => match other.parse::<f64>() {
+                    Ok(n) => json!(n),
+                    Err(_) => json!(raw),
+                },
+            };
+            args.insert(key, value);
+            param_search = pclose_end;
+        }
+        let arguments = Value::String(Value::Object(args).to_string());
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        calls.push(json!({
+            "id": format!("call_zenshim_dsml_{n}"),
+            "type": "function",
+            "name": name,
+            "arguments": arguments,
+        }));
+        search = close_end;
+        let _ = invoke_start;
+    }
+    calls
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,6 +1553,57 @@ mod tests {
         let call = &completion["choices"][0]["message"]["tool_calls"][0];
         let arguments: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
         assert!(arguments["command"].as_str().unwrap().contains("```md"), "arguments intact");
+    }
+
+    #[test]
+    fn deepseek_dsml_markup_becomes_native_tool_calls() {
+        // Captured from a live pi session 2026-10-16: deepseek ignored the
+        // fence protocol and emitted its native DSML markup as text.
+        let b = ['\u{FF5C}', '\u{FF5C}'];
+        let marker = |word: &str| format!("<{b0}{b1}DSML{b0}{b1} {word}>", b0 = b[0], b1 = b[1]);
+        let dsml = format!(
+            "{calls}\n{invoke_bash}\n{param_bash}\n{close_invoke}\n{invoke_read}\n{param_read}\n{close_invoke}\n{close_calls}",
+            calls = marker("calls"),
+            invoke_bash = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"bash\">",
+            param_bash = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"command\" string=\"true\">find src -type f | sort</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>",
+            close_invoke = "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>",
+            invoke_read = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"read\">",
+            param_read = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"path\" string=\"true\">/tmp/architecture.md</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>",
+            close_calls = "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>",
+        );
+        let (out, translator) = run(ApiFormat::OpenAi, &[&format!("Exploring.\n{dsml}")], "response.completed");
+        assert!(!out.concat().contains("DSML"), "no markup leak");
+        assert_eq!(translator.outcome().0, "tool_calls");
+        let completion = translator.into_completion();
+        let calls = completion["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "bash");
+        let args0: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args0["command"], "find src -type f | sort");
+        assert_eq!(calls[1]["function"]["name"], "read");
+        let args1: Value = serde_json::from_str(calls[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args1["path"], "/tmp/architecture.md");
+    }
+
+    #[test]
+    fn dsml_split_across_chat_chunks_and_prose_mentions_survive() {
+        let head = "Go.\n<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>\n<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"bash\">\n";
+        let tail = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"command\" string=\"true\">echo dsml</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>\n</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>\n</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>";
+        let (out, translator) = run_chat(
+            ApiFormat::OpenAi,
+            &[chat_chunk(json!({ "content": head }), None), chat_chunk(json!({ "content": tail }), None), chat_chunk(json!({}), Some("stop"))],
+            true,
+        );
+        assert!(!out.concat().contains("DSML"), "no markup leak");
+        let completion = translator.into_completion();
+        let call = &completion["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "bash");
+        let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["command"], "echo dsml");
+        // Prose mentioning DSML stays untouched.
+        let (_, prose) = run(ApiFormat::OpenAi, &["DSML is deepseek's tool dialect."], "response.completed");
+        let text = prose.into_completion()["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+        assert_eq!(text, "DSML is deepseek's tool dialect.");
     }
 
     #[test]
