@@ -42,8 +42,14 @@ pub struct StreamTranslator {
     responses_sequence: u64,
     responses_started: bool,
     responses_text_open: bool,
+    /// Output index of the text item (1 when a reasoning item precedes it).
+    responses_text_index: usize,
+    responses_reasoning_open: bool,
     /// Request fields a Responses object echoes back.
     responses_echo: Value,
+    /// Reasoning/thinking summary text forwarded from upstream.
+    reasoning_text: String,
+    anthropic_thinking_open: bool,
 }
 
 const FENCE_OPEN: &str = "```tool";
@@ -81,7 +87,11 @@ impl StreamTranslator {
             responses_sequence: 0,
             responses_started: false,
             responses_text_open: false,
+            responses_text_index: 0,
+            responses_reasoning_open: false,
             responses_echo: json!({}),
+            reasoning_text: String::new(),
+            anthropic_thinking_open: false,
         }
     }
 
@@ -111,6 +121,19 @@ impl StreamTranslator {
         format!("msg_{}", self.id.trim_start_matches("resp_"))
     }
 
+    fn responses_reasoning_id(&self) -> String {
+        format!("rs_{}", self.id.trim_start_matches("resp_"))
+    }
+
+    fn responses_reasoning_item(&self, status: &str, text: &str) -> Value {
+        json!({
+            "id": self.responses_reasoning_id(),
+            "type": "reasoning",
+            "status": status,
+            "summary": if status == "in_progress" { json!([]) } else { json!([{ "type": "summary_text", "text": text }]) },
+        })
+    }
+
     fn responses_message(&self, status: &str, text: &str) -> Value {
         let content = match status {
             "in_progress" => json!([]),
@@ -137,10 +160,14 @@ impl StreamTranslator {
         })
     }
 
-    /// The output items of the finished answer: its text, then its calls.
+    /// The output items of the finished answer: reasoning (if any), its
+    /// text, then its calls.
     fn responses_output(&self) -> Vec<Value> {
         let text = self.flushed_text.trim();
         let mut output = Vec::new();
+        if !self.reasoning_text.trim().is_empty() {
+            output.push(self.responses_reasoning_item("completed", self.reasoning_text.trim()));
+        }
         if !text.is_empty() {
             output.push(self.responses_message("completed", text));
         }
@@ -200,20 +227,43 @@ impl StreamTranslator {
     fn responses_text_delta(&mut self, text: &str, out: &mut Vec<String>) {
         self.responses_ensure_started(out);
         let item_id = self.responses_message_id();
+        let index = self.responses_text_index;
         if !self.responses_text_open {
             self.responses_text_open = true;
             let item = self.responses_message("in_progress", "");
-            out.push(self.responses_event("response.output_item.added", json!({ "output_index": 0, "item": item })));
+            out.push(self.responses_event("response.output_item.added", json!({ "output_index": index, "item": item })));
             out.push(self.responses_event(
                 "response.content_part.added",
                 json!({
-                    "item_id": item_id, "output_index": 0, "content_index": 0,
+                    "item_id": item_id, "output_index": index, "content_index": 0,
                     "part": { "type": "output_text", "text": "", "annotations": [] },
                 }),
             ));
         }
         out.push(self.responses_event(
             "response.output_text.delta",
+            json!({ "item_id": item_id, "output_index": index, "content_index": 0, "delta": text }),
+        ));
+    }
+
+    /// Forward a reasoning/thinking delta as a native reasoning item.
+    fn responses_reasoning_delta(&mut self, text: &str, out: &mut Vec<String>) {
+        self.responses_ensure_started(out);
+        let item_id = self.responses_reasoning_id();
+        if !self.responses_reasoning_open {
+            self.responses_reasoning_open = true;
+            self.responses_text_index = 1;
+            out.push(self.responses_event(
+                "response.output_item.added",
+                json!({ "output_index": 0, "item": self.responses_reasoning_item("in_progress", "") }),
+            ));
+            out.push(self.responses_event(
+                "response.reasoning_summary_part.added",
+                json!({ "item_id": item_id, "output_index": 0, "content_index": 0, "part": { "type": "summary_text", "text": "" } }),
+            ));
+        }
+        out.push(self.responses_event(
+            "response.reasoning_summary_text.delta",
             json!({ "item_id": item_id, "output_index": 0, "content_index": 0, "delta": text }),
         ));
     }
@@ -223,23 +273,44 @@ impl StreamTranslator {
     fn responses_finish(&mut self, out: &mut Vec<String>) {
         self.responses_ensure_started(out);
         let mut index = 0;
+        if self.responses_reasoning_open {
+            let item_id = self.responses_reasoning_id();
+            let text = self.reasoning_text.trim().to_string();
+            out.push(self.responses_event(
+                "response.reasoning_summary_text.done",
+                json!({ "item_id": item_id, "output_index": 0, "content_index": 0, "text": text }),
+            ));
+            out.push(self.responses_event(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "item_id": item_id, "output_index": 0, "content_index": 0,
+                    "part": { "type": "summary_text", "text": text },
+                }),
+            ));
+            out.push(self.responses_event(
+                "response.output_item.done",
+                json!({ "output_index": 0, "item": self.responses_reasoning_item("completed", &text) }),
+            ));
+            index = 1;
+        }
         if self.responses_text_open {
             let item_id = self.responses_message_id();
+            let text_index = self.responses_text_index;
             let text = self.flushed_text.trim().to_string();
             out.push(self.responses_event(
                 "response.output_text.done",
-                json!({ "item_id": item_id, "output_index": 0, "content_index": 0, "text": text }),
+                json!({ "item_id": item_id, "output_index": text_index, "content_index": 0, "text": text }),
             ));
             out.push(self.responses_event(
                 "response.content_part.done",
                 json!({
-                    "item_id": item_id, "output_index": 0, "content_index": 0,
+                    "item_id": item_id, "output_index": text_index, "content_index": 0,
                     "part": { "type": "output_text", "text": text, "annotations": [] },
                 }),
             ));
             let item = self.responses_message("completed", &text);
-            out.push(self.responses_event("response.output_item.done", json!({ "output_index": 0, "item": item })));
-            index = 1;
+            out.push(self.responses_event("response.output_item.done", json!({ "output_index": text_index, "item": item })));
+            index = text_index + 1;
         }
         for call in self.emitted_tool_calls.clone() {
             let pending = Self::responses_call(&call, "in_progress");
@@ -330,6 +401,8 @@ impl StreamTranslator {
 
     fn anthropic_open_text_block(&mut self, out: &mut Vec<String>) {
         self.anthropic_ensure_started(out);
+        // Thinking must precede text: close it first if it is open.
+        self.anthropic_close_thinking_block(out);
         if self.anthropic_text_block_open {
             return;
         }
@@ -340,6 +413,48 @@ impl StreamTranslator {
                 "type": "content_block_start",
                 "index": self.anthropic_block_index,
                 "content_block": { "type": "text", "text": "" },
+            }),
+        ));
+    }
+
+    fn anthropic_close_thinking_block(&mut self, out: &mut Vec<String>) {
+        if !self.anthropic_thinking_open {
+            return;
+        }
+        self.anthropic_thinking_open = false;
+        out.push(self.anthropic_event(
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": self.anthropic_block_index }),
+        ));
+        self.anthropic_block_index += 1;
+    }
+
+    /// Forward a thinking delta as a native thinking block (no signature:
+    /// zenshim's request translation flattens history into a transcript,
+    /// so echoed thinking blocks never return to the model).
+    fn anthropic_reasoning_delta(&mut self, text: &str, out: &mut Vec<String>) {
+        self.anthropic_ensure_started(out);
+        if !self.anthropic_thinking_open {
+            if self.anthropic_text_block_open {
+                // Text already started: thinking cannot precede it anymore.
+                return;
+            }
+            self.anthropic_thinking_open = true;
+            out.push(self.anthropic_event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": self.anthropic_block_index,
+                    "content_block": { "type": "thinking", "thinking": "" },
+                }),
+            ));
+        }
+        out.push(self.anthropic_event(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": self.anthropic_block_index,
+                "delta": { "type": "thinking_delta", "thinking": text },
             }),
         ));
     }
@@ -360,17 +475,11 @@ impl StreamTranslator {
     // Fence holdback (format-agnostic)
     // ------------------------------------------------------------------
 
-    /// How much of the buffer is safe to flush (cannot be part of a fence).
-    fn safe_len(&self) -> usize {
-        // Anything from the last fence opener onward stays buffered until
-        // finish(), so complete blocks are parsed (not leaked as content)
-        // and incomplete blocks are never partially flushed.
-        if let Some(pos) = self.buffer.rfind(FENCE_OPEN) {
-            return pos;
-        }
-        // Partial fence opener at the tail: hold the partial prefix.
-        // Compared as bytes: the tail may end inside a multi-byte character,
-        // where slicing the string itself would panic.
+    /// How much of the tail is safe to flush when no full fence opener is
+    /// present: everything except a partial opener prefix at the end.
+    /// Compared as bytes: the tail may end inside a multi-byte character,
+    /// where slicing the string itself would panic.
+    fn safe_tail(&self) -> usize {
         let bytes = self.buffer.as_bytes();
         let fence = FENCE_OPEN.as_bytes();
         for hold in (1..=fence.len()).rev() {
@@ -378,7 +487,51 @@ impl StreamTranslator {
                 return bytes.len() - hold;
             }
         }
-        self.buffer.len()
+        bytes.len()
+    }
+
+    /// Consume the buffer: flush text that cannot be part of a tool
+    /// block, harvest complete closed blocks as they close (so text that
+    /// follows them streams live instead of waiting for the end), and
+    /// re-emit unparseable blocks as visible text so the model can see
+    /// its own malformed call and self-correct. With `final_flush` an
+    /// unclosed or malformed remainder is kept as text too.
+    fn pump(&mut self, final_flush: bool, out: &mut Vec<String>) {
+        loop {
+            let Some(open) = self.buffer.find(FENCE_OPEN) else {
+                // No fence opener: flush what cannot grow into one.
+                let safe = if final_flush { self.buffer.len() } else { self.safe_tail() };
+                if safe > 0 {
+                    let flushed: String = self.buffer.drain(..safe).collect();
+                    self.emit_text(&flushed, out);
+                }
+                return;
+            };
+            if open > 0 {
+                let pre: String = self.buffer.drain(..open).collect();
+                self.emit_text(&pre, out);
+            }
+            match scan_tool_block(&self.buffer, FENCE_OPEN.len()) {
+                Some((payload, end)) => {
+                    let consumed: String = self.buffer.drain(..end).collect();
+                    match parse_tool_block(&payload) {
+                        Some(call) => self.emitted_tool_calls.push(call),
+                        // Not a valid call: keep it visible as text.
+                        None => self.emit_text(&consumed, out),
+                    }
+                }
+                // Incomplete block or prose: hold everything from the
+                // opener; the final flush decides (unclosed/malformed
+                // blocks become text for self-correction).
+                None => {
+                    if final_flush {
+                        let rest: String = self.buffer.drain(..).collect();
+                        self.emit_text(&rest, out);
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Emit one flushed text delta in the active format.
@@ -404,6 +557,22 @@ impl StreamTranslator {
         }
     }
 
+    /// Forward one reasoning/thinking delta in the active format. The
+    /// direct route previously dropped these; reasoning models (muse-spark
+    /// & the paid GPT catalog) think visibly.
+    fn emit_reasoning(&mut self, text: &str, out: &mut Vec<String>) {
+        if text.is_empty() {
+            return;
+        }
+        self.reasoning_text.push_str(text);
+        match self.format {
+            // DeepSeek-style reasoning_content, the de-facto convention.
+            ApiFormat::OpenAi => out.push(self.openai_chunk(json!({ "reasoning_content": text }), None)),
+            ApiFormat::Responses => self.responses_reasoning_delta(text, out),
+            ApiFormat::Anthropic => self.anthropic_reasoning_delta(text, out),
+        }
+    }
+
     /// Feed one zen SSE event; returns rendered SSE strings to emit.
     pub fn feed(&mut self, event: &str, data: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -418,11 +587,12 @@ impl StreamTranslator {
             "response.output_text.delta" => {
                 if let Some(delta) = parsed.get("delta").and_then(Value::as_str) {
                     self.buffer.push_str(delta);
-                    let safe = self.safe_len();
-                    if safe > 0 {
-                        let flushed: String = self.buffer.drain(..safe).collect();
-                        self.emit_text(&flushed, &mut out);
-                    }
+                    self.pump(false, &mut out);
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(delta) = parsed.get("delta").and_then(Value::as_str) {
+                    self.emit_reasoning(delta, &mut out);
                 }
             }
             "response.completed" | "response.incomplete" | "response.failed" => {
@@ -448,29 +618,9 @@ impl StreamTranslator {
     /// Flush everything: remaining text, parsed tool calls, finish reason.
     fn finish(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        let text = self.buffer.clone();
-        let mut rest = text.as_str();
-        let mut clean_text = String::new();
-        while let Some(start) = rest.find(FENCE_OPEN) {
-            clean_text.push_str(&rest[..start]);
-            let after_open = &rest[start + FENCE_OPEN.len()..];
-            match after_open.find("```") {
-                Some(end) => {
-                    let payload = &after_open[..end];
-                    if let Some(call) = parse_tool_block(payload) {
-                        self.emitted_tool_calls.push(call);
-                    }
-                    rest = &after_open[end + 3..];
-                }
-                None => {
-                    rest = "";
-                }
-            }
-        }
-        clean_text.push_str(rest);
-        let clean_text = clean_text.trim().to_string();
-        self.emit_text(&clean_text, &mut out);
+        self.pump(true, &mut out);
         if self.format == ApiFormat::Anthropic {
+            self.anthropic_close_thinking_block(&mut out);
             self.anthropic_close_text_block(&mut out);
         }
 
@@ -614,10 +764,14 @@ impl StreamTranslator {
         }
         // finish() already flushed whatever the buffer still held.
         let content = self.flushed_text.trim().to_string();
+        let reasoning = self.reasoning_text.trim().to_string();
         match self.format {
             ApiFormat::OpenAi => {
                 let mut message =
                     json!({ "role": "assistant", "content": if content.is_empty() { Value::Null } else { json!(content) } });
+                if !reasoning.is_empty() {
+                    message["reasoning_content"] = json!(reasoning);
+                }
                 if !self.emitted_tool_calls.is_empty() {
                     let calls: Vec<Value> = self
                         .emitted_tool_calls
@@ -653,6 +807,9 @@ impl StreamTranslator {
             }
             ApiFormat::Anthropic => {
                 let mut blocks: Vec<Value> = Vec::new();
+                if !reasoning.is_empty() {
+                    blocks.push(json!({ "type": "thinking", "thinking": reasoning }));
+                }
                 if !content.is_empty() {
                     blocks.push(json!({ "type": "text", "text": content }));
                 }
@@ -684,6 +841,64 @@ impl StreamTranslator {
             }
         }
     }
+}
+
+/// Find the end of a fenced tool block whose opener begins the string
+/// (`from` = just past "```tool"): the FIRST balanced JSON object —
+/// braces tracked with string/escape awareness — followed by the closing
+/// fence.
+///
+/// This is what makes bash tool calls work: command strings routinely
+/// contain triple backticks (heredocs writing markdown, echoed code
+/// fences…), so "close at the first ```" truncates the JSON and the call
+/// is lost. Brace scanning finds the real end of the JSON first, then
+/// expects the closing fence after it. All scanned characters are ASCII,
+/// so byte indexing is UTF-8-safe.
+///
+/// Returns the payload and the index just past the closing fence, or
+/// None while the block is still incomplete (streaming) or the text is
+/// not a well-formed block (prose mentioning ```tool).
+fn scan_tool_block(s: &str, from: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let mut start = from;
+    while start < bytes.len() && bytes[start] != b'{' {
+        start += 1;
+    }
+    if start == bytes.len() {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut j = start;
+    while j < bytes.len() {
+        let ch = bytes[j];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == b'\\' {
+                escape = true;
+            } else if ch == b'"' {
+                in_string = false;
+            }
+        } else if ch == b'"' {
+            in_string = true;
+        } else if ch == b'{' {
+            depth += 1;
+        } else if ch == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                let rest = &s[j + 1..];
+                let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+                return trimmed.strip_prefix("```").map(|after| {
+                    let end = s.len() - after.len();
+                    (s[start..j + 1].to_string(), end)
+                });
+            }
+        }
+        j += 1;
+    }
+    None
 }
 
 fn parse_tool_block(payload: &str) -> Option<Value> {
@@ -889,6 +1104,99 @@ mod tests {
         assert!(!translator.is_finished());
         assert!(!translator.close().is_empty());
         assert_eq!(translator.into_completion()["choices"][0]["message"]["content"], "Half an ans");
+    }
+
+    #[test]
+    fn a_bash_command_containing_triple_backticks_keeps_its_tool_call() {
+        // Heredocs writing markdown etc: closing at the first ``` used to
+        // truncate the JSON and lose the call ("model stops midway").
+        let command = "cat > README.md <<'EOF'\n# Title\n```bash\nls\n```\nEOF";
+        let json = json!({ "name": "bash", "arguments": { "command": command } }).to_string();
+        let deltas = [format!("Writing.\n```tool\n{json}\n```\nDone.")];
+        let refs: Vec<&str> = deltas.iter().map(String::as_str).collect();
+        let (out, translator) = run(ApiFormat::OpenAi, &refs, "response.completed");
+        assert!(translator.outcome().0 == "tool_calls");
+        let completion = translator.into_completion();
+        let call = &completion["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "bash");
+        let arguments: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["command"], command);
+        assert!(!out.concat().contains("```tool"), "no fence leak");
+    }
+
+    #[test]
+    fn an_unparseable_block_is_kept_as_visible_text() {
+        let deltas = ["Trying.\n```tool\nnot json at all\n```\nAfter."];
+        let (out, translator) = run(ApiFormat::OpenAi, &deltas, "response.completed");
+        assert_eq!(translator.outcome().0, "stop");
+        let text = openai_text(&out);
+        assert!(text.contains("```tool\nnot json at all\n```"), "raw block stays visible");
+        assert!(text.contains("After."));
+    }
+
+    #[test]
+    fn text_after_a_closed_block_streams_live() {
+        // The block closes in the first delta; "After." must arrive as its
+        // own delta BEFORE the completion event, not only at finish.
+        let block = "```tool\n{\"name\": \"t\", \"arguments\": {}}\n```";
+        let mut translator = StreamTranslator::new(ApiFormat::OpenAi, "m".to_string());
+        let before: Vec<String> = translator.feed("response.output_text.delta", &delta(&format!("Before.\n{block}\n")));
+        let after: Vec<String> = translator.feed("response.output_text.delta", &delta("After."));
+        assert_eq!(openai_text(&before), "Before.\n\n");
+        assert_eq!(openai_text(&after), "After.", "post-fence text streams live");
+    }
+
+    #[test]
+    fn reasoning_summary_text_is_forwarded_in_every_dialect() {
+        for format in [ApiFormat::OpenAi, ApiFormat::Responses, ApiFormat::Anthropic] {
+            let mut translator = StreamTranslator::new(format, "m".to_string());
+            let mut out = Vec::new();
+            out.extend(translator.feed("response.reasoning_summary_text.delta", &delta("Think")));
+            out.extend(translator.feed("response.reasoning_summary_text.delta", &delta(" hard")));
+            out.extend(translator.feed("response.output_text.delta", &delta("Answer.")));
+            out.extend(translator.feed("response.completed", DONE));
+            let wire = out.concat();
+            assert!(!wire.is_empty());
+            let completion = translator.into_completion();
+            match format {
+                ApiFormat::OpenAi => {
+                    let reasoning: String = out
+                        .iter()
+                        .filter_map(|c| c.strip_prefix("data: "))
+                        .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+                        .filter_map(|c| c["choices"][0]["delta"]["reasoning_content"].as_str().map(String::from))
+                        .collect();
+                    assert_eq!(reasoning, "Think hard");
+                    assert_eq!(completion["choices"][0]["message"]["reasoning_content"], "Think hard");
+                    assert_eq!(completion["choices"][0]["message"]["content"], "Answer.");
+                }
+                ApiFormat::Responses => {
+                    let events = responses_events(&out);
+                    assert_eq!(events[0].0, "response.created");
+                    assert_eq!(events[2].0, "response.output_item.added");
+                    assert_eq!(events[2].1["item"]["type"], "reasoning");
+                    let said: String = events
+                        .iter()
+                        .filter(|(name, _)| name == "response.reasoning_summary_text.delta")
+                        .map(|(_, data)| data["delta"].as_str().unwrap().to_string())
+                        .collect();
+                    assert_eq!(said, "Think hard");
+                    let response = &completion["output"];
+                    assert_eq!(response[0]["type"], "reasoning");
+                    assert_eq!(response[0]["summary"][0]["text"], "Think hard");
+                    assert_eq!(response[1]["content"][0]["text"], "Answer.");
+                }
+                ApiFormat::Anthropic => {
+                    assert!(wire.contains("\"type\":\"thinking\""), "thinking block emitted");
+                    assert!(wire.contains("thinking_delta"));
+                    let blocks = completion["content"].as_array().unwrap();
+                    assert_eq!(blocks[0]["type"], "thinking");
+                    assert_eq!(blocks[0]["thinking"], "Think hard");
+                    assert_eq!(blocks[1]["type"], "text");
+                    assert_eq!(blocks[1]["text"], "Answer.");
+                }
+            }
+        }
     }
 
     #[test]

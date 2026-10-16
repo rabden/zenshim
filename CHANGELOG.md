@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Tool-call blocks whose JSON contains triple backticks (bash heredocs
+  writing markdown, echoed code fences) are no longer truncated at the
+  first ``` — the block end is now found by scanning for the first
+  balanced JSON object with string/escape awareness, then the closing
+  fence. Previously such calls were lost and the turn silently ended
+  mid-task.
+- An unparseable fenced block is now kept as visible text instead of
+  being dropped, so the model can see its own malformed call and
+  self-correct.
+- Text that follows a closed tool block now streams live instead of
+  being held back until the end of the response.
+
+### Added
+- Reasoning/thinking summaries from the direct route are forwarded to
+  clients instead of dropped: Anthropic `thinking` blocks, Responses
+  `reasoning` items, and DeepSeek-style `reasoning_content` for the
+  OpenAI chat dialect, in streams and final objects alike.
+
 ## 0.5.0
 
 ### Added

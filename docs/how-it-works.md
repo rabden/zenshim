@@ -81,7 +81,13 @@ As the answer streams back, zenshim watches for these fenced blocks,
 holds them out of the visible text, parses them, and emits them as real
 tool calls in the client's dialect: `tool_calls`, a `function_call`
 item, or a `tool_use` block. A partial fence at the end of a chunk is
-held back until it is clear whether it starts a call. Tool results the
+held back until it is clear whether it starts a call. A block's end is
+found by scanning for the first balanced JSON object — so commands
+that themselves contain triple backticks (heredocs writing markdown)
+survive intact — and a block that does not parse is kept as visible
+text so the model can self-correct. Thinking summaries are forwarded
+too: Anthropic `thinking` blocks, Responses `reasoning` items, or
+`reasoning_content` in the OpenAI chat dialect. Tool results the
 client sends later are written into the next transcript.
 
 ### 3. Sending
