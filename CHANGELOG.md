@@ -16,6 +16,19 @@
   being held back until the end of the response.
 
 ### Added
+- **Dual-protocol upstream**: zen now serves every free model on the
+  endpoint it actually lives on — chat-native frees
+  (`glm-5.3-flash-free`, `deepseek-v4.1-flash-free`, …) go to
+  `/chat/completions` with a chat-shaped wire body, muse and the paid
+  Responses catalog to `/responses` (probed live 2026-10-16; the API
+  publishes no endpoint metadata).
+- **Automatic protocol fallback**: a 400 protocol mismatch is retried
+  once on the other endpoint with the request translated and the
+  response cross-translated; the learned endpoint is cached per model
+  for the process. Chat upstreams' `reasoning_content` is forwarded
+  like Responses thinking, and finish_reason riding the final
+  content-bearing chunk (deepseek's shape) no longer truncates a
+  tool-call JSON payload.
 - Reasoning/thinking summaries from the direct route are forwarded to
   clients instead of dropped: Anthropic `thinking` blocks, Responses
   `reasoning` items, and DeepSeek-style `reasoning_content` for the

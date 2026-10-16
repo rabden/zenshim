@@ -96,8 +96,13 @@ The key scheduler produces an ordered list of attempts (each key over
 the direct route, then through the CLI) and the first that answers wins.
 [Keys, routes and fallback](routing.md) describes the policy.
 
-**Direct route.** The translated request is posted to Zen's
-`/responses` endpoint, and the reply is a server-sent event stream.
+**Direct route.** The translated request is posted to the endpoint the
+model lives on — `/responses` for muse and the paid Responses catalog,
+`/chat/completions` for the chat-native frees (each model's endpoint is
+guessed from its id, confirmed on the first request, and remembered).
+The reply is a server-sent event stream in either dialect; a protocol
+mismatch (the endpoint changed, or a brand-new model) is retried once
+on the other endpoint with the request and stream translated.
 
 **CLI route.** zenshim starts `opencode serve` in a sandbox and drives
 it over its local HTTP API:

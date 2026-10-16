@@ -30,22 +30,110 @@ const BRIDGE_NOTE: &str = "This session answers a request from an API client. Th
 /// The same request, reshaped for the CLI route. OpenCode takes session
 /// instructions (its system channel), one text and attachments, and it
 /// needs none of the direct wire's workarounds for the marker prompt.
+/// Which zen endpoint serves a model. Probed live 2026-10-16: muse-spark
+/// frees are Responses-native, every other `-free` id is served on
+/// /chat/completions only, and asking the wrong endpoint answers 400.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upstream {
+    /// POST {base}/responses — the Responses event stream.
+    Responses,
+    /// POST {base}/chat/completions — chat.completion.chunk stream.
+    Chat,
+}
+
+impl Upstream {
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Responses => "/responses",
+            Self::Chat => "/chat/completions",
+        }
+    }
+
+    pub fn flip(self) -> Self {
+        match self {
+            Self::Responses => Self::Chat,
+            Self::Chat => Self::Responses,
+        }
+    }
+}
+
+/// Guess a model's endpoint without metadata (the API publishes none):
+/// muse-spark is the one Responses-native free family; unknown `-free`
+/// ids are chat-native; everything else defaults to Responses. The
+/// per-model learned cache (see `learn_upstream`) corrects mistakes
+/// after one mismatch round-trip.
+pub fn guess_upstream(model: &str) -> Upstream {
+    if model.starts_with("muse-spark") {
+        Upstream::Responses
+    } else if model.ends_with("-free") {
+        Upstream::Chat
+    } else {
+        Upstream::Responses
+    }
+}
+
+/// Protocol confirmed by a live request, per model id, process-wide.
+fn learned() -> &'static std::sync::Mutex<std::collections::HashMap<String, Upstream>> {
+    static LEARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Upstream>>> =
+        std::sync::OnceLock::new();
+    LEARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn learned_upstream(model: &str) -> Option<Upstream> {
+    learned().lock().unwrap().get(model).copied()
+}
+
+pub fn learn_upstream(model: &str, upstream: Upstream) {
+    learned().lock().unwrap().insert(model.to_string(), upstream);
+}
+
 pub fn bridge_prompt(zen_body: &Value) -> BridgePrompt {
-    let system = zen_body
-        .pointer("/input/1/content")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let system = system.strip_prefix(DISREGARD_PREAMBLE).unwrap_or(system);
+    // The body may be Responses-shaped (input) or chat-shaped (messages):
+    // read the second and third messages from whichever is present, with
+    // their part types normalized (input_text/text, string/object image).
+    let user_field = |body: &Value, pointer: &str| -> Value {
+        let empty = Vec::new();
+        let parts = body.pointer(pointer).and_then(Value::as_array).unwrap_or(&empty);
+        Value::Array(
+            parts
+                .iter()
+                .map(|part| match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "input_text" => json!({ "type": "text", "text": part.get("text").cloned().unwrap_or(Value::Null) }),
+                    "input_image" => {
+                        let uri = part.get("image_url").cloned().unwrap_or(Value::Null);
+                        let uri = match uri {
+                            Value::String(s) => Value::String(s),
+                            Value::Object(map) => map.get("url").cloned().unwrap_or(Value::Null),
+                            other => other,
+                        };
+                        json!({ "type": "image_url", "image_url": uri })
+                    }
+                    _ => part.clone(),
+                })
+                .collect(),
+        )
+    };
+    let is_responses = zen_body.get("input").is_some();
+    let system = if is_responses {
+        zen_body.pointer("/input/1/content").and_then(Value::as_str).unwrap_or_default().to_string()
+    } else {
+        zen_body.pointer("/messages/1/content").and_then(Value::as_str).unwrap_or_default().to_string()
+    };
+    let system = system.strip_prefix(DISREGARD_PREAMBLE).unwrap_or(&system);
     // The tool protocol only matters when the client offered tools.
     let system = match system.contains("<available-tools>") {
         true => system,
         false => system.strip_suffix(TOOL_PROTOCOL).unwrap_or(system),
     };
-    let empty = Vec::new();
-    let parts = zen_body
-        .pointer("/input/2/content")
-        .and_then(Value::as_array)
-        .unwrap_or(&empty);
+    let parts: Vec<Value> = if is_responses {
+        user_field(zen_body, "/input/2/content").as_array().cloned().unwrap_or_default()
+    } else {
+        match zen_body.pointer("/messages/2/content") {
+            Some(Value::Array(_)) => user_field(zen_body, "/messages/2/content").as_array().cloned().unwrap_or_default(),
+            Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+            _ => Vec::new(),
+        }
+    };
     let transcript = parts
         .first()
         .and_then(|part| part.get("text"))
@@ -361,13 +449,79 @@ pub fn build_zen_body(request: &Value, zen_model: &str) -> Value {
         "stream": true,
         "store": false,
     });
-    if let Some(max) = request.get("max_tokens").and_then(Value::as_u64) {
-        // Reasoning models burn output tokens on thinking; tiny client
-        // budgets yield empty visible text. Floor at 1024 and report the
-        // real truncation through stop_reason/finish_reason instead.
-        body["max_output_tokens"] = json!(max.max(1024));
+    if let Some(max) = max_output_tokens(request) {
+        body["max_output_tokens"] = json!(max);
     }
     body
+}
+
+/// Output budget with the reasoning floor applied: reasoning models burn
+/// output tokens on thinking; tiny client budgets yield empty visible
+/// text. Floor at 1024 and report the real truncation through
+/// stop_reason/finish_reason instead.
+fn max_output_tokens(request: &Value) -> Option<u64> {
+    request.get("max_tokens").and_then(Value::as_u64).map(|max| max.max(1024))
+}
+
+/// Convert a built zen Responses body to the chat/completions dialect:
+/// the same [developer(marker), system(defused), user(transcript)]
+/// shape with chat part types (text / image_url objects) and field
+/// names.
+pub fn zen_responses_body_to_chat(responses_body: &Value) -> Value {
+    let input = responses_body.get("input").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut messages: Vec<Value> = Vec::new();
+    for message in &input {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
+        let content = message.get("content").unwrap_or(&Value::Null);
+        let chat_content = match content {
+            Value::String(text) => Value::String(text.clone()),
+            Value::Array(parts) => Value::Array(
+                parts
+                    .iter()
+                    .map(|part| match part.get("type").and_then(Value::as_str).unwrap_or("") {
+                        "input_text" => json!({ "type": "text", "text": part.get("text").cloned().unwrap_or(Value::String(String::new())) }),
+                        "input_image" => {
+                            let uri = part.get("image_url").cloned().unwrap_or(Value::Null);
+                            let uri = match uri {
+                                Value::String(s) => Value::String(s),
+                                Value::Object(map) => map.get("url").cloned().unwrap_or(Value::Null),
+                                other => other,
+                            };
+                            json!({ "type": "image_url", "image_url": { "url": uri } })
+                        }
+                        _ => part.clone(),
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        };
+        messages.push(json!({ "role": role, "content": chat_content }));
+    }
+    let mut body = json!({
+        "model": responses_body.get("model").cloned().unwrap_or(Value::Null),
+        "messages": messages,
+        "stream": true,
+    });
+    if let Some(max) = responses_body.get("max_output_tokens").cloned() {
+        body["max_tokens"] = max;
+    }
+    body
+}
+
+/// Build the zen wire body for the chosen upstream protocol.
+pub fn build_zen_body_for(request: &Value, zen_model: &str, upstream: Upstream) -> Value {
+    match upstream {
+        Upstream::Responses => build_zen_body(request, zen_model),
+        Upstream::Chat => zen_responses_body_to_chat(&build_zen_body(request, zen_model)),
+    }
+}
+
+/// The same for an Anthropic Messages client request.
+pub fn build_zen_body_anthropic_for(request: &Value, zen_model: &str, upstream: Upstream) -> Value {
+    match upstream {
+        Upstream::Responses => build_zen_body_anthropic(request, zen_model),
+        Upstream::Chat => zen_responses_body_to_chat(&build_zen_body_anthropic(request, zen_model)),
+    }
 }
 
 /// Build the zen wire body from an Anthropic Messages API request.
@@ -507,11 +661,8 @@ pub fn build_zen_body_anthropic(request: &Value, zen_model: &str) -> Value {
         "stream": true,
         "store": false,
     });
-    if let Some(max) = request.get("max_tokens").and_then(Value::as_u64) {
-        // Reasoning models burn output tokens on thinking; tiny client
-        // budgets yield empty visible text. Floor at 1024 and report the
-        // real truncation through stop_reason/finish_reason instead.
-        body["max_output_tokens"] = json!(max.max(1024));
+    if let Some(max) = max_output_tokens(request) {
+        body["max_output_tokens"] = json!(max);
     }
     body
 }
@@ -537,6 +688,49 @@ fn content_text_anthropic(content: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_guess_follows_the_free_families() {
+        assert_eq!(guess_upstream("muse-spark-1.3-contributor-free"), Upstream::Responses);
+        assert_eq!(guess_upstream("muse-spark-9-free"), Upstream::Responses);
+        assert_eq!(guess_upstream("glm-5.3-flash-free"), Upstream::Chat);
+        assert_eq!(guess_upstream("some-brand-new-free"), Upstream::Chat);
+        assert_eq!(guess_upstream("gpt-5.5"), Upstream::Responses);
+    }
+
+    #[test]
+    fn learned_upstream_overrides_the_guess() {
+        learn_upstream("flip-test-free", Upstream::Responses);
+        assert_eq!(learned_upstream("flip-test-free"), Some(Upstream::Responses));
+        assert_eq!(guess_upstream("flip-test-free"), Upstream::Chat);
+    }
+
+    #[test]
+    fn chat_body_keeps_the_gate_shape_with_chat_parts_and_fields() {
+        let request = json!({
+            "model": "glm-5.3-flash-free",
+            "messages": [
+                { "role": "system", "content": "Be terse." },
+                { "role": "user", "content": "hi" },
+            ],
+            "max_tokens": 50,
+        });
+        let body = build_zen_body_for(&request, "glm-5.3-flash-free", Upstream::Chat);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "developer");
+        assert_eq!(messages[0]["content"], MARKER);
+        assert_eq!(messages[1]["role"], "system");
+        assert!(messages[1]["content"].as_str().unwrap().starts_with(DISREGARD_PREAMBLE));
+        assert_eq!(messages[2]["role"], "user");
+        let parts = messages[2]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(body["max_tokens"], json!(1024)); // reasoning floor
+        assert!(body.get("input").is_none());
+        assert!(body.get("store").is_none());
+    }
+
     use super::*;
 
     fn served() -> Vec<String> {

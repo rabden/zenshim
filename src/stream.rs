@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
 
+use crate::translate::Upstream;
+
 /// Which client-facing API shape a stream/request renders as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiFormat {
@@ -50,6 +52,11 @@ pub struct StreamTranslator {
     /// Reasoning/thinking summary text forwarded from upstream.
     reasoning_text: String,
     anthropic_thinking_open: bool,
+    /// Which zen endpoint this stream comes from: Responses events or
+    /// chat.completion.chunks. Set before the first feed().
+    upstream: Upstream,
+    /// Chat upstreams: finish_reason arrived; decide at usage/[DONE].
+    chat_finish_pending: bool,
 }
 
 const FENCE_OPEN: &str = "```tool";
@@ -92,7 +99,14 @@ impl StreamTranslator {
             responses_echo: json!({}),
             reasoning_text: String::new(),
             anthropic_thinking_open: false,
+            upstream: Upstream::Responses,
+            chat_finish_pending: false,
         }
+    }
+
+    /// Select the upstream dialect before the first event is fed.
+    pub fn set_upstream(&mut self, upstream: Upstream) {
+        self.upstream = upstream;
     }
 
     /// The response id clients will see.
@@ -579,6 +593,9 @@ impl StreamTranslator {
         if self.finished {
             return out;
         }
+        if self.upstream == Upstream::Chat {
+            return self.feed_chat(data);
+        }
         let parsed: Value = match serde_json::from_str(data) {
             Ok(v) => v,
             Err(_) => return out,
@@ -611,6 +628,61 @@ impl StreamTranslator {
                 out.extend(self.finish());
             }
             _ => {}
+        }
+        out
+    }
+
+    /// Ingest one chat.completion.chunk frame (chat-native upstream).
+    /// Mirrors the Responses feed: text through the fence pump, thinking
+    /// forwarded, and the decision delayed until usage/[DONE] because
+    /// upstreams put finish_reason on a content-bearing chunk (deepseek)
+    /// and send usage only afterwards.
+    fn feed_chat(&mut self, data: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let trimmed = data.trim();
+        if trimmed == "[DONE]" {
+            out.extend(self.finish());
+            return out;
+        }
+        let parsed: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => return out,
+        };
+        if let Some(u) = parsed.get("usage").filter(|u| !u.is_null()) {
+            let input = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let output = u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+            self.usage = Some(json!({
+                "prompt_tokens": input,
+                "completion_tokens": output,
+                "total_tokens": input + output,
+            }));
+            let choices_empty = parsed
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_none_or(|choices| choices.is_empty());
+            if choices_empty || self.chat_finish_pending {
+                out.extend(self.finish());
+            }
+            return out;
+        }
+        let Some(choice) = parsed.pointer("/choices/0").cloned() else {
+            return out;
+        };
+        if let Some(delta) = choice.get("delta") {
+            if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+                self.emit_reasoning(text, &mut out);
+            }
+            if let Some(text) = delta.get("content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                self.buffer.push_str(text);
+                self.pump(false, &mut out);
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if reason == "length" {
+                self.truncated = true;
+            }
+            self.chat_finish_pending = true;
+            // Decide at the usage chunk or [DONE], which follow.
         }
         out
     }
@@ -1197,6 +1269,97 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn chat_chunk(delta: serde_json::Value, finish: Option<&str>) -> String {
+        let mut choice = json!({ "index": 0, "delta": delta });
+        if let Some(reason) = finish {
+            choice["finish_reason"] = json!(reason);
+        }
+        json!({ "id": "cc", "object": "chat.completion.chunk", "created": 5, "model": "glm", "choices": [choice] }).to_string()
+    }
+
+    const CHAT_USAGE: &str = r#"{"id":"cc","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":6,"total_tokens":14}}"#;
+
+    /// Run a chat-native upstream chunk sequence through the translator.
+    fn run_chat(format: ApiFormat, chunks: &[String], done: bool) -> (Vec<String>, StreamTranslator) {
+        let mut translator = StreamTranslator::new(format, "m".to_string());
+        translator.set_upstream(crate::translate::Upstream::Chat);
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(translator.feed("", chunk));
+        }
+        out.extend(translator.feed("", CHAT_USAGE));
+        if done {
+            out.extend(translator.feed("", "[DONE]"));
+        }
+        (out, translator)
+    }
+
+    #[test]
+    fn chat_upstream_tool_blocks_become_native_calls_in_every_dialect() {
+        let fence = "`".repeat(3);
+        let block = format!("{fence}tool\n{}\n{fence}", r#"{"name": "bash", "arguments": {"command": "echo hi"}}"#);
+        for format in [ApiFormat::OpenAi, ApiFormat::Responses, ApiFormat::Anthropic] {
+            let chunks = vec![
+                chat_chunk(json!({ "role": "assistant", "content": "" }), None),
+                chat_chunk(json!({ "content": format!("Checking.\n{block}\nDone.") }), None),
+                chat_chunk(json!({}), Some("stop")),
+            ];
+            let (out, translator) = run_chat(format, &chunks, true);
+            assert!(!out.concat().contains("```tool"), "no fence leak in {format:?}");
+            let completion = translator.into_completion();
+            match format {
+                ApiFormat::OpenAi => {
+                    let call = &completion["choices"][0]["message"]["tool_calls"][0];
+                    assert_eq!(call["function"]["name"], "bash");
+                    assert_eq!(completion["choices"][0]["finish_reason"], "tool_calls");
+                    assert_eq!(completion["choices"][0]["message"]["content"], "Checking.\n\nDone.");
+                    assert_eq!(completion["usage"]["total_tokens"], 14);
+                }
+                ApiFormat::Responses => {
+                    let output = &completion["output"];
+                    assert_eq!(output[0]["content"][0]["text"], "Checking.\n\nDone.");
+                    assert_eq!(output[1]["type"], "function_call");
+                    assert_eq!(output[1]["name"], "bash");
+                    assert_eq!(completion["usage"]["total_tokens"], 14);
+                }
+                ApiFormat::Anthropic => {
+                    let blocks = completion["content"].as_array().unwrap();
+                    assert_eq!(blocks[0]["text"], "Checking.\n\nDone.");
+                    assert_eq!(blocks[1]["type"], "tool_use");
+                    assert_eq!(completion["stop_reason"], "tool_use");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chat_upstream_reasoning_and_deepseek_style_combined_finish_chunk() {
+        // reasoning_content passes through; the JSON's last characters ride
+        // the SAME chunk as finish_reason and must not be lost.
+        let fence = "`".repeat(3);
+        let head = r#"{"name": "bash", "arguments": "#.to_string();
+        let tail = r#"{"command": "cat <<'EOF'\n```md\n# hi\n```\nEOF"}}"#.to_string();
+        let mut translator = StreamTranslator::new(ApiFormat::OpenAi, "m".to_string());
+        translator.set_upstream(crate::translate::Upstream::Chat);
+        let mut out = Vec::new();
+        out.extend(translator.feed("", &chat_chunk(json!({ "reasoning_content": "Think." }), None)));
+        out.extend(translator.feed("", &chat_chunk(json!({ "content": format!("Go.\n{fence}tool\n{head}") }), None)));
+        out.extend(translator.feed("", &chat_chunk(json!({ "content": format!("{tail}\n{fence}") }), Some("stop"))));
+        out.extend(translator.feed("", CHAT_USAGE));
+        out.extend(translator.feed("", "[DONE]"));
+        let reasoning: String = out
+            .iter()
+            .filter_map(|c| c.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+            .filter_map(|c| c["choices"][0]["delta"]["reasoning_content"].as_str().map(String::from))
+            .collect();
+        assert_eq!(reasoning, "Think.");
+        let completion = translator.into_completion();
+        let call = &completion["choices"][0]["message"]["tool_calls"][0];
+        let arguments: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert!(arguments["command"].as_str().unwrap().contains("```md"), "arguments intact");
     }
 
     #[test]

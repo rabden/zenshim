@@ -26,7 +26,10 @@ use crate::keys::{Backend, Failure, KeyPool, Route};
 use crate::limits::{Busy, Limits, RateLimiter, Slots};
 use crate::responses::{self, Prepared, ResponseStore};
 use crate::stream::{ApiFormat as StreamFormat, StreamTranslator};
-use crate::translate::{bridge_prompt, build_zen_body, build_zen_body_anthropic, resolve_model};
+use crate::translate::{
+    bridge_prompt, build_zen_body_anthropic_for, build_zen_body_for, guess_upstream, learn_upstream,
+    learned_upstream, resolve_model, Upstream,
+};
 use crate::wizard::{http_client, UPSTREAM_BASE, ZEN_USER_AGENT};
 
 pub mod format {
@@ -369,10 +372,16 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 }
 
 /// One attempt over zenshim's own imitation of the OpenCode wire.
-async fn direct(state: &AppState, key: &str, zen_body: &Value, session: &str) -> Result<EventStream, Failure> {
+async fn direct(
+    state: &AppState,
+    key: &str,
+    zen_body: &Value,
+    session: &str,
+    path: &str,
+) -> Result<EventStream, Failure> {
     let send = state
         .http
-        .post(format!("{}/responses", state.upstream_base))
+        .post(format!("{}{}", state.upstream_base, path))
         .bearer_auth(key)
         .header("User-Agent", ZEN_USER_AGENT)
         .header("x-opencode-client", "cli")
@@ -408,6 +417,9 @@ struct Refusal {
     status: StatusCode,
     message: String,
     retry_after: Option<Duration>,
+    /// The upstream said the model lives on the other endpoint; the
+    /// caller should retry once with the protocol flipped.
+    wrong_protocol: bool,
 }
 
 /// Get an answer started, working through the scheduler's plan: each key
@@ -418,6 +430,7 @@ async fn dispatch_upstream(
     zen_model: &str,
     session: &str,
     tracker: &Tracker,
+    upstream: Upstream,
 ) -> Result<EventStream, Refusal> {
     let plan = state.pool.plan(SystemTime::now());
     if plan.is_empty() {
@@ -426,6 +439,7 @@ async fn dispatch_upstream(
             status: StatusCode::TOO_MANY_REQUESTS,
             message: "all upstream keys are exhausted; they are retried as their quotas reset".to_string(),
             retry_after: wait.map(|w| w.min(Duration::from_secs(3600))),
+            wrong_protocol: false,
         });
     }
     let mut last: Option<Failure> = None;
@@ -436,7 +450,7 @@ async fn dispatch_upstream(
             continue;
         }
         let result = match attempt.route {
-            Route::Direct => direct(state, &attempt.key, zen_body, session).await,
+            Route::Direct => direct(state, &attempt.key, zen_body, session, upstream.path()).await,
             Route::Cli => state
                 .bridge
                 .generate(&attempt.key, zen_model, bridge_prompt(zen_body), state.limits.request_timeout)
@@ -460,7 +474,16 @@ async fn dispatch_upstream(
                     413 => StatusCode::PAYLOAD_TOO_LARGE,
                     _ => StatusCode::BAD_REQUEST,
                 };
-                return Err(Refusal { status, message: message.clone(), retry_after: None });
+                // A protocol mismatch is retryable on the other endpoint.
+                let wrong_protocol = status.as_u16() == 400
+                    && (message.contains("ModelProtocolUnsupported")
+                        || message.contains("Request validation failed"));
+                return Err(Refusal {
+                    status,
+                    message: message.clone(),
+                    retry_after: None,
+                    wrong_protocol,
+                });
             }
             Failure::Auth(_) => refused_key = Some(attempt.key.clone()),
             Failure::Unavailable(_) if !state.bridge.usable() => state.pool.set_cli_ready(false),
@@ -473,16 +496,19 @@ async fn dispatch_upstream(
             status: StatusCode::TOO_MANY_REQUESTS,
             message: format!("all upstream keys are exhausted. last error: {message}"),
             retry_after: Some(Duration::from_secs(60)),
+            wrong_protocol: false,
         },
         Some(failure) => Refusal {
             status: StatusCode::BAD_GATEWAY,
             message: failure.message().to_string(),
             retry_after: None,
+            wrong_protocol: false,
         },
         None => Refusal {
             status: StatusCode::BAD_GATEWAY,
             message: "no upstream route is available".to_string(),
             retry_after: None,
+            wrong_protocol: false,
         },
     })
 }
@@ -771,19 +797,33 @@ async fn handle(
         }
     };
 
-    let zen_body = match format {
-        StreamFormat::OpenAi | StreamFormat::Responses => build_zen_body(chat, &zen_model),
-        StreamFormat::Anthropic => build_zen_body_anthropic(chat, &zen_model),
-    };
     let fingerprint = conversation_fingerprint(chat);
     let session = state.sessions.lock().unwrap().get_or_create(fingerprint, ids::session_id);
 
-    let events = match dispatch_upstream(&state, &zen_body, &zen_model, &session, &tracker).await {
-        Ok(events) => events,
-        Err(refusal) => return fail(tracker, refusal.status, &refusal.message, refusal.retry_after),
+    // Which zen endpoint serves this model: learned from a live request
+    // if we have seen it, otherwise a guess (muse = Responses, other
+    // frees = chat) — corrected after one mismatch round-trip.
+    let mut upstream = learned_upstream(&zen_model).unwrap_or_else(|| guess_upstream(&zen_model));
+    let (events, served_on) = loop {
+        let zen_body = match format {
+            StreamFormat::OpenAi | StreamFormat::Responses => build_zen_body_for(chat, &zen_model, upstream),
+            StreamFormat::Anthropic => build_zen_body_anthropic_for(chat, &zen_model, upstream),
+        };
+        match dispatch_upstream(&state, &zen_body, &zen_model, &session, &tracker, upstream).await {
+            Ok(events) => break (events, upstream),
+            Err(refusal) => {
+                if refusal.wrong_protocol {
+                    learn_upstream(&zen_model, upstream.flip());
+                    upstream = upstream.flip();
+                    continue;
+                }
+                return fail(tracker, refusal.status, &refusal.message, refusal.retry_after);
+            }
+        }
     };
 
     let mut translator = StreamTranslator::new(format, requested.to_string());
+    translator.set_upstream(served_on);
     if let Some(prepared) = &prepared {
         translator.echo(prepared.echo.clone());
     }
@@ -900,24 +940,48 @@ mod tests {
         event: response.output_text.delta\ndata: {\"delta\":\"ng \u{2713}\"}\n\n\
         event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
 
+    const CHAT_ANSWER: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"po\"}}]}\n\n\
+        data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ng \u{2713}\"}}]}\n\n\
+        data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+        data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n\
+        data: [DONE]\n\n";
+
     /// A stand-in for Zen: answers per upstream key as `behave` says.
     async fn fake_zen(behave: fn(&str) -> (u16, &'static str)) -> String {
-        let app = Router::new().route(
-            "/responses",
-            post(move |headers: HeaderMap| async move {
-                let key = headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "))
-                    .unwrap_or_default();
-                let (status, body) = behave(key);
-                let mut response = (StatusCode::from_u16(status).unwrap(), body).into_response();
-                if status == 200 {
-                    response.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
-                }
-                response
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/responses",
+                post(move |headers: HeaderMap| async move {
+                    let key = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .unwrap_or_default();
+                    let (status, body) = behave(key);
+                    let mut response = (StatusCode::from_u16(status).unwrap(), body).into_response();
+                    if status == 200 {
+                        response.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+                    }
+                    response
+                }),
+            )
+            .route(
+                "/chat/completions",
+                post(move |headers: HeaderMap| async move {
+                    let key = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .unwrap_or_default();
+                    let (status, body) = behave(key);
+                    let body = if status == 200 { CHAT_ANSWER } else { body };
+                    let mut response = (StatusCode::from_u16(status).unwrap(), body).into_response();
+                    if status == 200 {
+                        response.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+                    }
+                    response
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -950,11 +1014,88 @@ mod tests {
         (format!("http://{address}"), state)
     }
 
+    /// Like `gateway` but with a chosen served model (protocol guessing
+    /// is model-dependent).
+    async fn gateway_model(upstream: String, keys: &[&str], model: &str) -> String {
+        let pool = KeyPool::new(keys.iter().map(|k| k.to_string()).collect(), Backend::Direct, None);
+        let state = Arc::new(AppState {
+            http: reqwest::Client::new(),
+            formats: format::ServeFormats::Both,
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            models: RwLock::new(vec![model.to_string()]),
+            pool,
+            bridge: BridgePool::new(None),
+            gateway_key: RwLock::new("gateway-secret".to_string()),
+            rate: RateLimiter::new(Limits::default().rate_per_minute),
+            slots: Slots::new(&Limits::default()),
+            limits: Limits::default(),
+            upstream_base: upstream,
+            sessions: Mutex::new(SessionCache::default()),
+            responses: ResponseStore::default(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    /// A stand-in where /responses answers ModelProtocolUnsupported and
+    /// /chat/completions serves the model: the fallback path.
+    async fn fake_zen_chat_only() -> String {
+        let app = Router::new()
+            .route(
+                "/responses",
+                post(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        r#"{"type":"error","error":{"type":"ModelProtocolUnsupported","message":"Model does not support this protocol."}}"#,
+                    )
+                }),
+            )
+            .route(
+                "/chat/completions",
+                post(|| async {
+                    let mut response = CHAT_ANSWER.to_string().into_response();
+                    response.headers_mut().insert("content-type", "text/event-stream".parse().unwrap());
+                    response
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_protocol_mismatch_falls_back_to_the_other_endpoint_and_is_learned() {
+        // muse-* guesses Responses; the stand-in only serves chat.
+        let base = gateway_model(fake_zen_chat_only().await, &["k1"], "muse-spark-1.3-contributor-free").await;
+        let response = chat_model(&base, "muse-spark-1.3-contributor-free").send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        // Non-streaming client: a complete chat.completion object.
+        let completion: Value = response.json().await.unwrap();
+        assert_eq!(completion["choices"][0]["message"]["content"], "pong \u{2713}");
+        assert_eq!(completion["usage"]["total_tokens"], 5);
+        // Learned: a second request goes straight to the chat endpoint.
+        assert_eq!(
+            crate::translate::learned_upstream("muse-spark-1.3-contributor-free"),
+            Some(crate::translate::Upstream::Chat)
+        );
+        let response = chat_model(&base, "muse-spark-1.3-contributor-free").send().await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
     fn chat(base: &str) -> reqwest::RequestBuilder {
+        chat_model(base, "test-model-free")
+    }
+
+    fn chat_model(base: &str, model: &str) -> reqwest::RequestBuilder {
         reqwest::Client::new()
             .post(format!("{base}/v1/chat/completions"))
             .bearer_auth("gateway-secret")
-            .json(&json!({ "model": "test-model-free", "messages": [{ "role": "user", "content": "ping" }] }))
+            .json(&json!({ "model": model, "messages": [{ "role": "user", "content": "ping" }] }))
     }
 
     async fn body(response: reqwest::Response) -> Value {
