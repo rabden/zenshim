@@ -501,6 +501,12 @@ impl StreamTranslator {
                 return bytes.len() - hold;
             }
         }
+        // A partial XML opener at the tail ("<tool", "<tool_call", …).
+        for hold in (5..=XML_CALL_OPEN.len().min(bytes.len())).rev() {
+            if self.buffer.ends_with(&XML_CALL_OPEN[..hold]) {
+                return bytes.len() - hold;
+            }
+        }
         // A partial DSML opener at the tail ("<｜", "<｜｜DS", …) is held
         // until it is clear whether a block starts.
         const DSML_OPEN: &str = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>";
@@ -523,29 +529,73 @@ impl StreamTranslator {
     /// unclosed or malformed remainder is kept as text too.
     fn pump(&mut self, final_flush: bool, out: &mut Vec<String>) {
         loop {
-            // Earliest tool-call marker wins: a ```tool fence or a DSML
-            // block opener, whichever comes first in the buffer.
+            // Earliest tool-call marker wins: a ```tool fence, a DSML
+            // block opener, or an XML <tool_call> block.
             let fence = self.buffer.find(FENCE_OPEN);
             let dsml = dsml_marker(&self.buffer, 0, false, "calls").map(|(start, _, _)| start);
-            let open_is_dsml = match (fence, dsml) {
-                (Some(f), Some(d)) => d < f,
-                (None, Some(_)) => true,
-                (None, None) => {
-                    // No opener: flush what cannot grow into one.
-                    let safe = if final_flush { self.buffer.len() } else { self.safe_tail() };
-                    if safe > 0 {
-                        let flushed: String = self.buffer.drain(..safe).collect();
-                        self.emit_text(&flushed, out);
-                    }
-                    return;
+            let xml = self.buffer.find(XML_CALL_OPEN);
+            if fence.is_none() && dsml.is_none() && xml.is_none() {
+                // No opener: flush what cannot grow into one.
+                let safe = if final_flush { self.buffer.len() } else { self.safe_tail() };
+                if safe > 0 {
+                    let flushed: String = self.buffer.drain(..safe).collect();
+                    self.emit_text(&flushed, out);
                 }
-                (Some(_), None) => false,
+                return;
+            }
+            let open_is_dsml = dsml.is_some_and(|d| fence.is_none_or(|f| d < f) && xml.is_none_or(|x| d < x));
+            let open_is_xml = !open_is_dsml && xml.is_some_and(|x| fence.is_none_or(|f| x < f));
+            let open = if open_is_dsml {
+                dsml
+            } else if open_is_xml {
+                xml
+            } else {
+                fence
             };
-            let open = if open_is_dsml { dsml } else { fence };
             let open = open.unwrap_or(0);
             if open > 0 {
                 let pre: String = self.buffer.drain(..open).collect();
                 self.emit_text(&pre, out);
+            }
+            if open_is_xml {
+                let open_end = open + XML_CALL_OPEN.len();
+                match self.buffer[open_end..].find(XML_CALL_CLOSE) {
+                    Some(i) => {
+                        let mut region_end = open_end + i + XML_CALL_CLOSE.len();
+                        // Swallow adjacent <tool_call> blocks (models emit
+                        // several back to back).
+                        loop {
+                            let next = self.buffer[region_end..].find(XML_CALL_OPEN);
+                            let next_close = next.and_then(|n| {
+                                self.buffer[region_end + n + XML_CALL_OPEN.len()..].find(XML_CALL_CLOSE)
+                            });
+                            match (next, next_close) {
+                                (Some(n), Some(c))
+                                    if self.buffer[region_end..region_end + n].trim().is_empty() =>
+                                {
+                                    region_end = region_end + n + XML_CALL_OPEN.len() + c + XML_CALL_CLOSE.len();
+                                }
+                                _ => break,
+                            }
+                        }
+                        let region: String = self.buffer.drain(..region_end).collect();
+                        let xml_calls = parse_xml_calls(&region);
+                        if xml_calls.is_empty() {
+                            self.emit_text(&region, out);
+                        } else {
+                            self.emitted_tool_calls.extend(xml_calls);
+                        }
+                    }
+                    // Incomplete XML block: hold; the final flush decides.
+                    None => {
+                        if final_flush {
+                            let rest: String = self.buffer.drain(..).collect();
+                            self.emit_text(&rest, out);
+                        }
+                        return;
+                    }
+                }
+                continue;
             }
             if open_is_dsml {
                 let (_, open_end, _) = dsml_marker(&self.buffer, 0, false, "calls").unwrap();
@@ -1021,8 +1071,23 @@ fn scan_tool_block(s: &str, from: usize) -> Option<(String, usize)> {
 
 fn parse_tool_block(payload: &str) -> Option<Value> {
     let parsed: Value = serde_json::from_str(payload.trim()).ok()?;
-    let name = parsed.get("name")?.as_str()?.to_string();
-    let arguments = parsed.get("arguments").cloned().unwrap_or(json!({}));
+    let name = match parsed.get("name").and_then(Value::as_str) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            // Models occasionally drop the name and emit bare bash
+            // arguments; "command" is the bash tool's signature argument.
+            if parsed.get("command").is_some() {
+                "bash".to_string()
+            } else {
+                return None;
+            }
+        }
+    };
+    let arguments = match parsed.get("name").and_then(Value::as_str) {
+        Some(_) => parsed.get("arguments").cloned().unwrap_or(json!({})),
+        // Name-less bash inference: the whole object is the arguments.
+        None => parsed.clone(),
+    };
     let arguments = match arguments {
         Value::String(s) => s,
         other => other.to_string(),
@@ -1180,6 +1245,108 @@ fn parse_dsml_block(block: &str) -> Vec<Value> {
         }));
         search = close_end;
         let _ = invoke_start;
+    }
+    calls
+}
+
+// Qwen/mimo-style XML tool calls, emitted as text when the model
+// ignores the fence protocol (observed live, mimo-v2.6-flash-free):
+//   <tool_call><function=bash><parameter=command>ls -la</parameter></function></tool_call>
+const XML_CALL_OPEN: &str = "<tool_call>";
+const XML_CALL_CLOSE: &str = "</tool_call>";
+
+/// `<function=NAME>` at `at`; returns the byte just past the tag and
+/// the name. Offsets tracked absolutely against `s`.
+fn xml_function_tag(s: &str, at: usize) -> Option<(usize, String)> {
+    let mut pos = at + "<function".len();
+    while matches!(&s[pos..].chars().next(), Some(' ') | Some('\t')) {
+        pos += 1;
+    }
+    if !s[pos..].starts_with('=') {
+        return None;
+    }
+    pos += 1;
+    while matches!(&s[pos..].chars().next(), Some(' ') | Some('\t') | Some('"')) {
+        pos += 1;
+    }
+    let rest = &s[pos..];
+    let end = rest.find(['>', ' ', '\t', '"'])?;
+    if end == 0 {
+        return None;
+    }
+    let name = rest[..end].to_string();
+    let after = &s[pos + end..];
+    let close = after.find('>')?;
+    Some((pos + end + close + 1, name))
+}
+
+/// `<parameter=K>V</parameter>` at `at`; returns (end, key, value).
+/// Offsets tracked absolutely against `s`.
+fn xml_parameter_tag(s: &str, at: usize) -> Option<(usize, String, String)> {
+    let mut pos = at + "<parameter".len();
+    while matches!(&s[pos..].chars().next(), Some(' ') | Some('\t')) {
+        pos += 1;
+    }
+    if !s[pos..].starts_with('=') {
+        return None;
+    }
+    pos += 1;
+    while matches!(&s[pos..].chars().next(), Some(' ') | Some('\t') | Some('"')) {
+        pos += 1;
+    }
+    let rest = &s[pos..];
+    let end = rest.find(['>', ' ', '\t', '"'])?;
+    if end == 0 {
+        return None;
+    }
+    let key = rest[..end].to_string();
+    let after = &s[pos + end..];
+    let close = after.find('>')?;
+    let body_start = pos + end + close + 1;
+    let close_len = s[body_start..].find("</parameter>")?;
+    let value = s[body_start..body_start + close_len].to_string();
+    Some((body_start + close_len + "</parameter>".len(), key, value))
+}
+
+/// Parse the <tool_call> blocks in a region into tool calls (empty when
+/// malformed). Prose mentioning the tags yields nothing.
+fn parse_xml_calls(region: &str) -> Vec<Value> {
+    let mut calls = Vec::new();
+    let mut search = 0;
+    while let Some(start) = region[search..].find(XML_CALL_OPEN) {
+        let open_end = search + start + XML_CALL_OPEN.len();
+        let Some((fn_end, name)) = xml_function_tag(region, open_end) else { break };
+        let close_end = region[fn_end..]
+            .find(XML_CALL_CLOSE)
+            .map(|i| fn_end + i + XML_CALL_CLOSE.len())
+            .unwrap_or(region.len());
+        let body = &region[fn_end..close_end];
+        let mut args = serde_json::Map::new();
+        let mut p = 0;
+        while let Some(at) = body[p..].find("<parameter") {
+            let at = p + at;
+            let Some((end, key, raw)) = xml_parameter_tag(body, at) else { break };
+            let trimmed = raw.trim();
+            let value = match trimmed {
+                "true" => json!(true),
+                "false" => json!(false),
+                other => match other.parse::<f64>() {
+                    Ok(n) => json!(n),
+                    Err(_) => json!(raw),
+                },
+            };
+            args.insert(key, value);
+            p = end;
+        }
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        calls.push(json!({
+            "id": format!("call_zenshim_xml_{n}"),
+            "type": "function",
+            "name": name,
+            "arguments": Value::String(Value::Object(args).to_string()),
+        }));
+        search = close_end;
     }
     calls
 }
@@ -1604,6 +1771,43 @@ mod tests {
         let (_, prose) = run(ApiFormat::OpenAi, &["DSML is deepseek's tool dialect."], "response.completed");
         let text = prose.into_completion()["choices"][0]["message"]["content"].as_str().unwrap().to_string();
         assert_eq!(text, "DSML is deepseek's tool dialect.");
+    }
+
+    #[test]
+    fn mimo_xml_tool_calls_become_native_calls() {
+        // Captured from a live pi session 2026-10-17.
+        let xml = concat!(
+            "<tool_call><function=bash><parameter=command>ls -la /disk2/desktop/extensions-A</parameter></function></tool_call>",
+            "<tool_call><function=bash><parameter=command>find /disk2/desktop/extensions-A -maxdepth 2 | head -100</parameter></function></tool_call>",
+        );
+        let (out, translator) = run(ApiFormat::OpenAi, &[&format!("Exploring.\n{xml}")], "response.completed");
+        assert!(!out.concat().contains("<tool_call>"), "no markup leak");
+        assert_eq!(translator.outcome().0, "tool_calls");
+        let completion = translator.into_completion();
+        let calls = completion["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "bash");
+        let args0: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args0["command"], "ls -la /disk2/desktop/extensions-A");
+        // Prose mentioning the tags survives.
+        let (_, prose) = run(ApiFormat::OpenAi, &["Qwen uses <tool_call> tags in some setups."], "response.completed");
+        let text = prose.into_completion()["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+        assert_eq!(text, "Qwen uses <tool_call> tags in some setups.");
+    }
+
+    #[test]
+    fn name_less_fence_with_a_command_key_infers_bash() {
+        // Captured from a live pi session 2026-10-17: deepseek dropped the
+        // name and emitted bare bash arguments in a ```tool fence.
+        let fence = "`".repeat(3);
+        let block = format!("{fence}tool\n{}\n{fence}", r#"{"command":"sha256sum README.md && wc -l README.md"}"#);
+        let (_, translator) = run(ApiFormat::OpenAi, &[&format!("Plan.\n{block}")], "response.completed");
+        assert_eq!(translator.outcome().0, "tool_calls");
+        let completion = translator.into_completion();
+        let call = &completion["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "bash");
+        let args: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["command"], "sha256sum README.md && wc -l README.md");
     }
 
     #[test]

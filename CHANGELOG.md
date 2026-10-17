@@ -16,6 +16,12 @@
   being held back until the end of the response.
 
 ### Fixed
+- Qwen/mimo-style XML tool calls
+  (`<tool_call><function=bash><parameter=command>…`) emitted as text
+  are harvested as native calls (a third marker type alongside fences
+  and DSML), and a fence whose JSON drops the `"name"` and holds bare
+  bash arguments (`{"command": …}`) is inferred as a bash call instead
+  of losing the turn.
 - DeepSeek models sometimes ignore the fence protocol and emit their
   native DSML tool markup (`<｜｜DSML｜｜ calls>…`) as plain text, ending
   the turn without running anything. The fence pump now recognizes DSML
@@ -24,6 +30,11 @@
   malformed markup stays visible for self-correction.
 
 ### Added
+- **Startup model refresh**: the served model list is reconciled with
+  the live `/models` catalog at every startup (unless `--models`
+  pinned it) — vanished models drop out, new frees appear, and a
+  free-only selection stays free-only. One line is logged when the
+  catalog shifted.
 - **Dual-protocol upstream**: zen now serves every free model on the
   endpoint it actually lives on — chat-native frees
   (`glm-5.3-flash-free`, `deepseek-v4.1-flash-free`, …) go to

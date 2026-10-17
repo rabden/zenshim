@@ -109,6 +109,55 @@ struct Cli {
     request_timeout: u64,
 }
 
+/// Reconcile a saved model selection with the live catalog: keep the
+/// saved picks that still exist, and when the selection was free-only
+/// (or everything vanished) fall back to the live free list. A
+/// free-only list never silently becomes all-models and vice versa.
+fn refresh_selection(saved: &[String], live: &[String], pinned_all: bool) -> Vec<String> {
+    let mut kept: Vec<String> = saved.iter().filter(|m| live.contains(m)).cloned().collect();
+    let free_only = !pinned_all && saved.iter().all(|m| m.contains("-free"));
+    if kept.is_empty() || free_only {
+        let frees: Vec<String> = live.iter().filter(|id| id.contains("-free")).cloned().collect();
+        if !frees.is_empty() {
+            kept = frees;
+        } else if kept.is_empty() {
+            kept = live.to_vec();
+        }
+    }
+    kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refresh_selection;
+
+    #[test]
+    fn vanished_models_drop_and_new_frees_appear() {
+        let saved = vec!["glm-free".to_string(), "gone-free".to_string()];
+        let live = vec!["glm-free".to_string(), "beam-free".to_string(), "paid-model".to_string()];
+        let got = refresh_selection(&saved, &live, false);
+        assert_eq!(got, vec!["glm-free".to_string(), "beam-free".to_string()]);
+    }
+
+    #[test]
+    fn an_all_models_selection_keeps_its_paid_picks() {
+        let saved = vec!["glm-free".to_string(), "gpt-paid".to_string()];
+        let live = vec!["glm-free".to_string(), "gpt-paid".to_string(), "beam-free".to_string()];
+        let got = refresh_selection(&saved, &live, false);
+        assert_eq!(got, vec!["glm-free".to_string(), "gpt-paid".to_string()]);
+    }
+
+    #[test]
+    fn everything_gone_falls_back_to_the_live_list() {
+        let saved = vec!["gone-free".to_string()];
+        let live = vec!["beam-free".to_string(), "paid".to_string()];
+        let got = refresh_selection(&saved, &live, false);
+        assert_eq!(got, vec!["beam-free".to_string()]);
+        let got = refresh_selection(&saved, &["paid".to_string()], false);
+        assert_eq!(got, vec!["paid".to_string()]);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -192,6 +241,29 @@ async fn main() -> Result<()> {
     }
     if cli.all_models && cli.models.is_none() {
         config.models = wizard::fetch_models(&http, &config.keys[0]).await?;
+    }
+    // The zen catalog drifts constantly (models appear, deprecate,
+    // re-home between endpoints), so refresh the served list from the
+    // live /models endpoint at every startup — unless flags pinned it.
+    if cli.models.is_none() {
+        let pinned_all = cli.all_models;
+        match wizard::fetch_models(&http, &config.keys[0]).await {
+            Ok(live) => {
+                let previous = config.models.clone();
+                config.models = refresh_selection(&previous, &live, pinned_all);
+                let added = config.models.iter().filter(|m| !previous.contains(m)).count();
+                let dropped = previous.iter().filter(|m| !config.models.contains(m)).count();
+                if added + dropped > 0 {
+                    println!(
+                        "models refreshed from the live catalog: +{added} -{dropped} (now serving {})",
+                        config.models.len()
+                    );
+                }
+            }
+            Err(e) => {
+                println!("warning: could not refresh the model catalog ({e}); serving the saved list");
+            }
+        }
     }
     if let Some(key) = &cli.gateway_key {
         config.gateway_key = key.clone();
