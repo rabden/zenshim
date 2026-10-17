@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 (2026-10-17)
 
 ### Fixed
 - Tool-call blocks whose JSON contains triple backticks (bash heredocs
