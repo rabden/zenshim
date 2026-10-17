@@ -1,6 +1,6 @@
 [package]
 name = "zenshim"
-version = "0.6.0"
+version = "0.5.1"
 edition = "2024"
 description = "Local OpenAI- and Anthropic-compatible gateway for OpenCode Zen's free tier"
 license = "MIT"
